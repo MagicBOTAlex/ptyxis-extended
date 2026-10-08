@@ -156,10 +156,6 @@ ptyxis_window_close_page_dialog_cb (GObject      *object,
   _ptyxis_tab_ignore_snapshot (tab);
 
   adw_tab_view_close_page_finish (self->tab_view, page, TRUE);
-
-  /* Resize if we are going from 2->1 tabs */
-  if (adw_tab_view_get_n_pages (self->tab_view) == 1)
-    gtk_window_set_default_size (GTK_WINDOW (self), -1, -1);
 }
 
 static gboolean
@@ -188,7 +184,6 @@ ptyxis_window_close_page_cb (PtyxisWindow *self,
       !ptyxis_settings_get_prompt_on_close (settings))
     {
       ptyxis_parking_lot_push (self->parking_lot, tab);
-      gtk_window_set_default_size (GTK_WINDOW (self), -1, -1);
       return GDK_EVENT_PROPAGATE;
     }
 
@@ -399,13 +394,33 @@ update_visible_and_maybe_close (PtyxisWindow *self)
 
   if (visible != was_visible)
     {
-      gtk_widget_set_visible (GTK_WIDGET (self->tab_bar), visible);
-      gtk_window_set_default_size (GTK_WINDOW (self), -1, -1);
+      GtkWidget *widget = GTK_WIDGET (self);
+      GtkWidget *tab_bar = GTK_WIDGET (self->tab_bar);
+      int width = gtk_widget_get_width (widget);
+      int height = gtk_widget_get_height (widget);
+      int min_height = 0;
+      int tab_bar_height = 0;
+
+      gtk_widget_measure (tab_bar, GTK_ORIENTATION_VERTICAL, width,
+                          &min_height, &tab_bar_height, NULL, NULL);
+      gtk_widget_set_visible (tab_bar, visible);
+
+      /* Resize the window by exactly the height of the tab bar so that the
+       * terminal grid (columns and rows) stays the same across the
+       * transition. Relying on the natural size here races the layout and
+       * makes the window jump, so compute the new size explicitly.
+       */
+      if (height > 0)
+        gtk_window_set_default_size (GTK_WINDOW (self),
+                                     width,
+                                     MAX (1, height + (visible ? tab_bar_height : -tab_bar_height)));
+      else
+        gtk_window_set_default_size (GTK_WINDOW (self), -1, -1);
 
       if (visible)
-        gtk_widget_add_css_class (GTK_WIDGET (self), "has-tab-bar");
+        gtk_widget_add_css_class (widget, "has-tab-bar");
       else
-        gtk_widget_remove_css_class (GTK_WIDGET (self), "has-tab-bar");
+        gtk_widget_remove_css_class (widget, "has-tab-bar");
     }
 }
 
@@ -2445,10 +2460,6 @@ ptyxis_window_add_tab (PtyxisWindow *self,
   page = adw_tab_view_insert (self->tab_view, GTK_WIDGET (tab), position);
 
   ptyxis_window_setup_page (self, tab, page);
-
-  /* Resize if we are going from 1->2 tabs */
-  if (adw_tab_view_get_n_pages (self->tab_view) == 2)
-    gtk_window_set_default_size (GTK_WINDOW (self), -1, -1);
 }
 
 void
@@ -2465,10 +2476,6 @@ ptyxis_window_add_tab_at_end (PtyxisWindow *self,
   page = adw_tab_view_insert (self->tab_view, GTK_WIDGET (tab), position);
 
   ptyxis_window_setup_page (self, tab, page);
-
-  /* Resize if we are going from 1->2 tabs */
-  if (adw_tab_view_get_n_pages (self->tab_view) == 2)
-    gtk_window_set_default_size (GTK_WINDOW (self), -1, -1);
 }
 
 PtyxisTab *
