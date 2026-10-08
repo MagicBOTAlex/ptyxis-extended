@@ -357,6 +357,28 @@ ptyxis_terminal_capture_key_pressed_cb (PtyxisTerminal     *self,
   g_assert (PTYXIS_IS_TERMINAL (self));
   g_assert (GTK_IS_EVENT_CONTROLLER_KEY (controller));
 
+  /* VTE offers no setting to remap keys and does not implement the Kitty
+   * keyboard protocol, so translate the few keys we need here. This mirrors
+   * wezterm's config and makes them work everywhere, including over SSH.
+   */
+
+  /* Ctrl+Backspace -> Ctrl+W (0x17) */
+  if (keyval == GDK_KEY_BackSpace &&
+      (state & GDK_CONTROL_MASK) != 0 &&
+      (state & (GDK_SHIFT_MASK | GDK_ALT_MASK | GDK_SUPER_MASK | GDK_META_MASK)) == 0)
+    {
+      vte_terminal_feed_child (VTE_TERMINAL (self), "\027", -1);
+      return GDK_EVENT_STOP;
+    }
+
+  /* Shift+Enter -> Kitty CSI-u, understood by opencode and other TUIs */
+  if ((keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) &&
+      (state & GDK_SHIFT_MASK) != 0 &&
+      (state & (GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_SUPER_MASK | GDK_META_MASK)) == 0)
+    {
+      vte_terminal_feed_child (VTE_TERMINAL (self), "\033[13;2u", -1);
+      return GDK_EVENT_STOP;
+    }
 
   /* HACK:
    *
