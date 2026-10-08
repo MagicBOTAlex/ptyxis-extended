@@ -395,25 +395,15 @@ update_visible_and_maybe_close (PtyxisWindow *self)
   if (visible != was_visible)
     {
       GtkWidget *widget = GTK_WIDGET (self);
-      GtkWidget *tab_bar = GTK_WIDGET (self->tab_bar);
       int width = gtk_widget_get_width (widget);
       int height = gtk_widget_get_height (widget);
-      int min_height = 0;
-      int tab_bar_height = 0;
 
-      gtk_widget_measure (tab_bar, GTK_ORIENTATION_VERTICAL, width,
-                          &min_height, &tab_bar_height, NULL, NULL);
-      gtk_widget_set_visible (tab_bar, visible);
+      gtk_widget_set_visible (GTK_WIDGET (self->tab_bar), visible);
 
-      /* Resize the window by exactly the height of the tab bar so that the
-       * terminal grid (columns and rows) stays the same across the
-       * transition. Relying on the natural size here races the layout and
-       * makes the window jump, so compute the new size explicitly.
-       */
-      if (height > 0)
-        gtk_window_set_default_size (GTK_WINDOW (self),
-                                     width,
-                                     MAX (1, height + (visible ? tab_bar_height : -tab_bar_height)));
+      /* Keep the window the same size across the transition; the terminal
+       * just gains or loses a row instead of the window moving around. */
+      if (width > 0 && height > 0)
+        gtk_window_set_default_size (GTK_WINDOW (self), width, height);
       else
         gtk_window_set_default_size (GTK_WINDOW (self), -1, -1);
 
