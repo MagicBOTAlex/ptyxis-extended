@@ -12,12 +12,27 @@
       ];
 
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
+
+      # VTE does not implement OSC 52 (clipboard), so build it with a patch
+      # that adds the handler and link ptyxis against the patched VTE.
+      pkgsFor =
+        system:
+        import nixpkgs {
+          inherit system;
+          overlays = [
+            (final: prev: {
+              vte-gtk4 = prev.vte-gtk4.overrideAttrs (old: {
+                patches = (old.patches or [ ]) ++ [ ./nix/vte-osc52.patch ];
+              });
+            })
+          ];
+        };
     in
     {
       packages = forAllSystems (
         system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          pkgs = pkgsFor system;
           ptyxis = pkgs.ptyxis.overrideAttrs (old: {
             src = self;
           });
@@ -31,7 +46,7 @@
       devShells = forAllSystems (
         system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          pkgs = pkgsFor system;
         in
         {
           default = pkgs.mkShell {
