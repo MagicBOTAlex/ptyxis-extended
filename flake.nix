@@ -22,7 +22,7 @@
           overlays = [
             (final: prev: {
               vte-gtk4 = prev.vte-gtk4.overrideAttrs (old: {
-                patches = (old.patches or [ ]) ++ [ ./nix/vte-osc52.patch ];
+                patches = (old.patches or [ ]) ++ [ ./nix/vte.patch ];
               });
             })
           ];

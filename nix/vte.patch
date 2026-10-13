@@ -1,0 +1,367 @@
+--- a/src/vteinternal.hh
++++ b/src/vteinternal.hh
+@@ -28,6 +28,10 @@
+ #endif
+ 
+ #include <climits>
++#include <memory>
++#include <string_view>
++#include <vector>
++
+ static_assert(CHAR_BIT == 8, "Weird");
+ 
+ /* END sanity checks */
+@@ -139,6 +143,21 @@
+ 	} sources[2];
+ } VtePaletteColor;
+ 
++/* An inline image (iTerm2 OSC 1337 File=) anchored to a grid position. */
++struct VteImage {
++        GdkTexture *texture{nullptr};
++        long top{0};          /* absolute grid row of the top edge */
++        long left{0};         /* grid column of the left edge */
++        int width{0};         /* painted width, in pixels */
++        int height{0};        /* painted height, in pixels */
++        int rows{1};          /* number of grid rows spanned, for culling */
++
++        VteImage() = default;
++        ~VteImage() { g_clear_object (&texture); }
++        VteImage (VteImage const&) = delete;
++        VteImage& operator= (VteImage const&) = delete;
++};
++
+ struct VteScreen {
+ public:
+         VteScreen(gulong max_rows,
+@@ -159,6 +178,8 @@
+         double scroll_delta{0.0}; /* scroll offset */
+         long insert_delta{0}; /* insertion offset */
+ 
++        std::vector<std::unique_ptr<VteImage>> images{}; /* inline images on this screen */
++
+         /* Stuff saved along with the cursor */
+         struct {
+                 VteVisualPosition cursor;  /* onscreen coordinate, that is, relative to insert_delta */
+@@ -1429,6 +1450,8 @@
+                                 guint rows);
+         void emit_copy_clipboard();
+         void emit_paste_clipboard();
++        void set_clipboard_text(vte::platform::ClipboardType type,
++                                std::string_view const& text) noexcept;
+         void emit_hyperlink_hover_uri_changed(const GdkRectangle *bbox);
+ 
+         void hyperlink_invalidate_and_get_bbox(vte::base::Ring::hyperlink_idx_t idx, GdkRectangle *bbox);
+@@ -1789,6 +1812,11 @@
+         void vte_termprop(vte::parser::Sequence const& seq,
+                           vte::parser::StringTokeniser::const_iterator& token,
+                           vte::parser::StringTokeniser::const_iterator const& endtoken) noexcept;
++        void xterm_set_xselection(vte::parser::Sequence const& seq,
++                                  vte::parser::StringTokeniser::const_iterator& token,
++                                  vte::parser::StringTokeniser::const_iterator const& endtoken) noexcept;
++        void iterm2_1337(vte::parser::Sequence const& seq,
++                         std::string_view const& body) noexcept;
+ 
+         void urxvt_extension(vte::parser::Sequence const& seq,
+                              vte::parser::StringTokeniser::const_iterator& token,
+--- a/src/vteseq.cc
++++ b/src/vteseq.cc
+@@ -2002,6 +2002,156 @@
+ }
+ 
+ void
++Terminal::xterm_set_xselection(vte::parser::Sequence const& seq,
++                               vte::parser::StringTokeniser::const_iterator& token,
++                               vte::parser::StringTokeniser::const_iterator const& endtoken) noexcept
++try
++{
++        // OSC 52 ; Pc ; Pd ST
++        //
++        // Pc selects the target (c = clipboard, p/s = primary) and Pd is the
++        // base64-encoded data. An empty Pc defaults to the clipboard.
++
++        if (token == endtoken)
++                return;
++
++        auto target = vte::platform::ClipboardType::CLIPBOARD;
++        auto const pc = token.string_view();
++        if (!pc.empty()) {
++                switch (pc.front()) {
++                case 'c':
++                        target = vte::platform::ClipboardType::CLIPBOARD;
++                        break;
++                case 'p':
++                case 's':
++                        target = vte::platform::ClipboardType::PRIMARY;
++                        break;
++                default:
++                        // Cut buffers (0-7) and anything else are unsupported.
++                        return;
++                }
++        }
++        ++token;
++
++        if (token == endtoken)
++                return;
++
++        auto const data = token.string();
++        if (data.empty() || data == "?")
++                return;
++
++        gsize len = 0;
++        g_autofree guchar *decoded = g_base64_decode (data.c_str(), &len);
++        if (decoded == nullptr)
++                return;
++
++        set_clipboard_text (target,
++                            std::string_view{reinterpret_cast<char const*>(decoded), len});
++}
++catch (...)
++{
++}
++
++void
++Terminal::iterm2_1337(vte::parser::Sequence const& seq,
++                      std::string_view const& body) noexcept
++try
++{
++        // iTerm2 inline image: OSC 1337 ; File=[params]:base64 ST
++        if (body.substr (0, 5) != "File="sv)
++                return;
++
++        auto const colon = body.find (':', 5);
++        if (colon == std::string_view::npos)
++                return;
++
++        auto const params = body.substr (5, colon - 5);
++        auto const encoded = body.substr (colon + 1);
++
++        auto inline_image = false;
++        auto do_not_move_cursor = false;
++
++        for (size_t pos = 0; pos <= params.size (); )
++                {
++                        auto const semi = params.find (';', pos);
++                        auto const token = params.substr (pos, semi == std::string_view::npos ? std::string_view::npos : semi - pos);
++                        pos = (semi == std::string_view::npos) ? params.size () + 1 : semi + 1;
++
++                        if (token.empty ())
++                                continue;
++
++                        auto const eq = token.find ('=');
++                        if (eq == std::string_view::npos)
++                                continue;
++
++                        auto const key = token.substr (0, eq);
++                        auto const value = token.substr (eq + 1);
++
++                        if (key == "inline"sv)
++                                inline_image = (value == "1"sv);
++                        else if (key == "doNotMoveCursor"sv)
++                                do_not_move_cursor = (value == "1"sv);
++                }
++
++        if (!inline_image)
++                return;
++
++        if (m_cell_width <= 0 || m_cell_height <= 0)
++                return;
++
++        auto const encoded_str = std::string{encoded};
++        gsize decoded_len = 0;
++        g_autofree guchar *decoded = g_base64_decode (encoded_str.c_str (), &decoded_len);
++        if (decoded == nullptr || decoded_len == 0)
++                return;
++
++        g_autoptr(GBytes) bytes = g_bytes_new (decoded, decoded_len);
++        g_autoptr(GError) error = nullptr;
++        auto *texture = gdk_texture_new_from_bytes (bytes, &error);
++        if (texture == nullptr)
++                return;
++
++        auto const native_width = gdk_texture_get_width (texture);
++        auto const native_height = gdk_texture_get_height (texture);
++
++        // Fit to the viewport, preserving the aspect ratio.
++        auto const max_width = int (m_column_count) * int (m_cell_width);
++        auto const max_height = int (m_row_count) * int (m_cell_height);
++        auto scale = 1.0;
++        if (native_width > max_width)
++                scale = double (max_width) / native_width;
++        if (native_height > max_height)
++                scale = std::min (scale, double (max_height) / native_height);
++        if (scale > 1.0)
++                scale = 1.0;
++
++        auto const width = std::max (1, int (native_width * scale));
++        auto const height = std::max (1, int (native_height * scale));
++        auto const columns = (width + int (m_cell_width) - 1) / int (m_cell_width);
++
++        auto image = std::make_unique<VteImage>();
++        image->texture = texture; // takes ownership of the reference
++        image->left = m_screen->cursor.col;
++        image->top = m_screen->cursor.row;
++        image->width = width;
++        image->height = height;
++        image->rows = (height + int (m_cell_height) - 1) / int (m_cell_height);
++
++        if (!do_not_move_cursor)
++                {
++                        for (int i = 1; i < image->rows; i++)
++                                cursor_down_with_scrolling (true);
++                        move_cursor_forward (columns);
++                }
++
++        m_screen->images.push_back (std::move (image));
++        invalidate_all ();
++}
++catch (...)
++{
++}
++
++void
+ Terminal::urxvt_extension(vte::parser::Sequence const& seq,
+                           vte::parser::StringTokeniser::const_iterator& token,
+                           vte::parser::StringTokeniser::const_iterator const& endtoken) noexcept
+@@ -7753,6 +7903,14 @@
+                 conemu_extension(seq, it, cend);
+                 break;
+ 
++        case VTE_OSC_XTERM_SET_XSELECTION:
++                xterm_set_xselection(seq, it, cend);
++                break;
++
++        case VTE_OSC_ITERM2_1337:
++                iterm2_1337(seq, it.string_view_remaining());
++                break;
++
+         case VTE_OSC_XTERM_SET_ICON_TITLE:
+         case VTE_OSC_XTERM_SET_XPROPERTY:
+         case VTE_OSC_XTERM_SET_COLOR_MOUSE_CURSOR_FG:
+@@ -7763,7 +7921,6 @@
+         case VTE_OSC_XTERM_SET_CURSOR_NAME:
+         case VTE_OSC_XTERM_LOGFILE:
+         case VTE_OSC_XTERM_SET_FONT:
+-        case VTE_OSC_XTERM_SET_XSELECTION:
+         case VTE_OSC_XTERM_SET_COLOR_MODE:
+         case VTE_OSC_XTERM_RESET_COLOR_MOUSE_CURSOR_FG:
+         case VTE_OSC_XTERM_RESET_COLOR_MOUSE_CURSOR_BG:
+@@ -7771,7 +7928,6 @@
+         case VTE_OSC_XTERM_RESET_COLOR_TEK_BG:
+         case VTE_OSC_XTERM_RESET_COLOR_TEK_CURSOR:
+         case VTE_OSC_EMACS_51:
+-        case VTE_OSC_ITERM2_1337:
+         case VTE_OSC_KONSOLE_30:
+         case VTE_OSC_KONSOLE_31:
+         case VTE_OSC_RLOGIN_SET_KANJI_MODE:
+--- a/src/vte.cc
++++ b/src/vte.cc
+@@ -953,6 +953,14 @@
+ 	g_signal_emit(m_terminal, signals[SIGNAL_PASTE_CLIPBOARD], 0);
+ }
+ 
++void
++Terminal::set_clipboard_text(vte::platform::ClipboardType type,
++                             std::string_view const& text) noexcept
++{
++        if (auto *w = widget())
++                w->clipboard_set_text (type, text.data(), text.size());
++}
++
+ /* Emit a "hyperlink_hover_uri_changed" signal. */
+ void
+ Terminal::emit_hyperlink_hover_uri_changed(const GdkRectangle *bbox)
+@@ -10104,6 +10112,22 @@
+                   m_cell_width,
+                   m_cell_height);
+ 
++        /* Draw inline images (iTerm2 OSC 1337) on top of the text. */
++        if (!m_screen->images.empty())
++                {
++                        auto const last_row = last_displayed_row();
++                        for (auto const& image : m_screen->images)
++                                {
++                                        if (image->top + image->rows - 1 < first_row || image->top > last_row)
++                                                continue;
++                                        m_draw.draw_image(image->texture,
++                                                          int(image->left * m_cell_width),
++                                                          row_to_pixel(image->top),
++                                                          image->width,
++                                                          image->height);
++                                }
++                }
++
+ 	paint_im_preedit_string();
+ 
+         m_draw.unclip_border();
+@@ -10742,6 +10766,10 @@
+                 m_tabstops.reset();
+         }
+ 
++        /* Drop any inline images. */
++        m_normal_screen.images.clear();
++        m_alternate_screen.images.clear();
++
+         /* Window title stack */
+         if (clear_history) {
+                 m_window_title_stack.clear();
+--- a/src/drawing-context.hh
++++ b/src/drawing-context.hh
+@@ -226,6 +226,17 @@
+                                                   int height,
+                                                   vte::color::rgb const* color) const = 0;
+ 
++        virtual void draw_image(
++#if VTE_GTK == 3
++                               cairo_surface_t *surface,
++#elif VTE_GTK == 4
++                               GdkTexture *texture,
++#endif
++                               int x,
++                               int y,
++                               int width,
++                               int height) const { }
++
+         void draw_undercurl(int x,
+                             double y,
+                             double line_width,
+--- a/src/drawing-gsk.hh
++++ b/src/drawing-gsk.hh
+@@ -120,6 +120,12 @@
+                                           int height,
+                                           vte::color::rgb const* color) const override;
+ 
++        void draw_image(GdkTexture *texture,
++                        int x,
++                        int y,
++                        int width,
++                        int height) const override;
++
+         void draw_text(TextRequest* requests,
+                        gsize n_requests,
+                        uint32_t attr,
+--- a/src/drawing-gsk.cc
++++ b/src/drawing-gsk.cc
+@@ -283,6 +283,23 @@
+ }
+ 
+ void
++DrawingGsk::draw_image(GdkTexture *texture,
++                       int x,
++                       int y,
++                       int width,
++                       int height) const
++{
++        if (texture == nullptr || width <= 0 || height <= 0)
++                return;
++
++        const auto bounds = vte::graphene::make_rect(x, y, width, height);
++        gtk_snapshot_append_scaled_texture(m_snapshot,
++                                           texture,
++                                           GSK_SCALING_FILTER_TRILINEAR,
++                                           &bounds);
++}
++
++void
+ DrawingGsk::begin_background(Rectangle const& rect,
+                              size_t columns,
+                              size_t rows)
