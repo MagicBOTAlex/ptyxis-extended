@@ -82,7 +82,7 @@ python3 scripts/lib/kitty_fixtures.py --selftest
 | `memory-images` | 100 × 100 kB chunked transmit/place/delete: alive, RSS bounded, no leak, still responsive |
 | `control-stock-vte` | system gnome-terminal: no image and **no probe reply** |
 | `iterm2-regression` | the **full** imgcat OSC 1337 suite (all 30 scenarios, including 100 kB/1 MB/5 MB payloads and the 32 MiB reject) stays green |
-| `opentui-demo` | optional stretch: real OpenTUI native-image demo selects Kitty (SKIP if unavailable) |
+| `opentui-demo` | real OpenTUI `native-image-demo.ts` run through a pty relay: asserts the demo sends the query, then ≥1 `a=t` transmit and ≥1 `a=p` placement (only happens after the terminal answers), plus a rich screenshot. SKIP without the prepared demo or `bun` |
 
 ## Notes / assumptions
 
@@ -107,6 +107,9 @@ python3 scripts/lib/kitty_fixtures.py --selftest
   dropped. OpenTUI splits at 3072 raw bytes = exactly 4096 base64 chars, so
   `chunk-apc-limit` and the default `shared-emitter-render` path fail. Scenarios
   that are not testing this cap use 3072-char chunks.
-- `scripts/opentui-kitty-findings.md` documents the stretch-goal investigation:
-  OpenTUI's client path was proven with a simulated Kitty reply; the checkout's
-  native library could not be built here (no Zig 0.16).
+- The OpenTUI demo needs a prepared workdir (`OPENTUI_DEMO_DIR`, default
+  `/tmp/opencode/opentui-pub`). `script(1)` cannot forward the terminal's probe
+  reply to the demo, so the harness runs it through `scripts/lib/pty_tee.py`
+  (a small raw-pty relay). See `scripts/opentui-kitty-findings.md` for the
+  client-path investigation and why the checkout's native library is not built
+  here (no Zig 0.16).
