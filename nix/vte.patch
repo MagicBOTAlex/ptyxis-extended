@@ -1,8 +1,8 @@
 diff --git a/src/drawing-context.hh b/src/drawing-context.hh
-index 771b1de..dac2ab0 100644
+index 771b1de..c3f1624 100644
 --- a/src/drawing-context.hh
 +++ b/src/drawing-context.hh
-@@ -226,6 +226,20 @@ public:
+@@ -226,6 +226,38 @@ public:
                                                    int height,
                                                    vte::color::rgb const* color) const = 0;
  
@@ -20,14 +20,32 @@ index 771b1de..dac2ab0 100644
 +                               int width,
 +                               int height) const { }
 +
++        /* Draw the sub-rectangle (@source_x, @source_y, @source_width,
++         * @source_height) of an image into the destination rectangle.  A
++         * non-positive source size means "the whole image". */
++        virtual void draw_image_part(
++#if VTE_GTK == 3
++                               cairo_surface_t *surface,
++#elif VTE_GTK == 4
++                               GdkTexture *texture,
++#endif
++                               int source_x,
++                               int source_y,
++                               int source_width,
++                               int source_height,
++                               int x,
++                               int y,
++                               int width,
++                               int height) const { }
++
          void draw_undercurl(int x,
                              double y,
                              double line_width,
 diff --git a/src/drawing-gsk.cc b/src/drawing-gsk.cc
-index 577bb0a..410d7b7 100644
+index 577bb0a..b2a9a25 100644
 --- a/src/drawing-gsk.cc
 +++ b/src/drawing-gsk.cc
-@@ -282,6 +282,24 @@ DrawingGsk::draw_surface_with_color_mask(GdkTexture *texture,
+@@ -282,6 +282,62 @@ DrawingGsk::draw_surface_with_color_mask(GdkTexture *texture,
          gtk_snapshot_pop(m_snapshot);
  }
  
@@ -38,25 +56,63 @@ index 577bb0a..410d7b7 100644
 +                       int width,
 +                       int height) const
 +{
++        draw_image_part(texture, 0, 0, 0, 0, x, y, width, height);
++}
++
++void
++DrawingGsk::draw_image_part(GdkTexture *texture,
++                            int source_x,
++                            int source_y,
++                            int source_width,
++                            int source_height,
++                            int x,
++                            int y,
++                            int width,
++                            int height) const
++{
 +        g_assert(m_snapshot);
 +        if (texture == nullptr || width <= 0 || height <= 0)
 +                return;
 +
-+        const auto bounds = vte::graphene::make_rect(x, y, width, height);
++        auto const texture_width = int(gdk_texture_get_width(texture));
++        auto const texture_height = int(gdk_texture_get_height(texture));
++        if (texture_width <= 0 || texture_height <= 0)
++                return;
++
++        if (source_width <= 0 || source_height <= 0) {
++                source_x = source_y = 0;
++                source_width = texture_width;
++                source_height = texture_height;
++        }
++
++        /* Scale the whole texture so that the source rectangle lands exactly
++         * on the destination rectangle, then clip to the destination so that
++         * nothing outside of it is painted. */
++        auto const scale_x = double(width) / double(source_width);
++        auto const scale_y = double(height) / double(source_height);
++        auto const bounds = vte::graphene::make_rect(
++                int(std::lround (double(x) - double(source_x) * scale_x)),
++                int(std::lround (double(y) - double(source_y) * scale_y)),
++                int(std::lround (double(texture_width) * scale_x)),
++                int(std::lround (double(texture_height) * scale_y)));
++        auto const clip = vte::graphene::make_rect(x, y, width, height);
++
++        gtk_snapshot_push_clip(m_snapshot, &clip);
 +        gtk_snapshot_append_scaled_texture(m_snapshot,
 +                                           texture,
 +                                           GSK_SCALING_FILTER_TRILINEAR,
 +                                           &bounds);
++        gtk_snapshot_pop(m_snapshot);
 +}
 +
  void
  DrawingGsk::begin_background(Rectangle const& rect,
                               size_t columns,
 diff --git a/src/drawing-gsk.hh b/src/drawing-gsk.hh
-index bfd58ad..cbeefdf 100644
+index bfd58ad..45af88d 100644
 --- a/src/drawing-gsk.hh
 +++ b/src/drawing-gsk.hh
-@@ -120,6 +120,12 @@ public:
+@@ -120,6 +120,22 @@ public:
                                            int height,
                                            vte::color::rgb const* color) const override;
  
@@ -66,9 +122,32 @@ index bfd58ad..cbeefdf 100644
 +                        int width,
 +                        int height) const override;
 +
++        void draw_image_part(GdkTexture *texture,
++                             int source_x,
++                             int source_y,
++                             int source_width,
++                             int source_height,
++                             int x,
++                             int y,
++                             int width,
++                             int height) const override;
++
          void draw_text(TextRequest* requests,
                         gsize n_requests,
                         uint32_t attr,
+diff --git a/src/parser-seq.py b/src/parser-seq.py
+index e62b6f9..a7e60a4 100755
+--- a/src/parser-seq.py
++++ b/src/parser-seq.py
+@@ -265,6 +265,8 @@ sequences = [
+                 comment='identify revised registration'),
+     seq_COMMAND('OSC',
+                 comment='operating system command'),
++    seq_COMMAND('APC',
++                comment='application program command'),
+ 
+     # Control characters
+     seq_CONTROL('NUL', 0x00, flags=Flags.NOP, source=Source.ECMA16,
 diff --git a/src/parser-string.hh b/src/parser-string.hh
 index e84a5ef..f429fcc 100644
 --- a/src/parser-string.hh
@@ -109,8 +188,138 @@ index e84a5ef..f429fcc 100644
          str->len = 0;
  }
  
+diff --git a/src/parser.hh b/src/parser.hh
+index d4b405b..75639ba 100644
+--- a/src/parser.hh
++++ b/src/parser.hh
+@@ -364,6 +364,7 @@ enum State {
+         DCS_INT,          /* intermediate DCS characters */
+         DCS_PASS,         /* DCS data passthrough */
+         OSC_STRING,       /* parsing OSC sequence */
++        APC_STRING,       /* parsing APC sequence */
+         ST_IGNORE,        /* unimplemented seq; ignore until ST */
+         SCI,              /* single character introducer sequence was started */
+ };
+@@ -414,8 +415,9 @@ public:
+                         return VTE_TRANSITION(raw, GROUND, action_execute);
+                 case 0x98:                /* SOS */
+                 case 0x9e:                /* PM */
+-                case 0x9f:                /* APC */
+                         return VTE_TRANSITION(raw, ST_IGNORE, action_st_ignore_start);
++                case 0x9f:                /* APC */
++                        return VTE_TRANSITION(raw, APC_STRING, action_apc_start);
+                         // FIXMEchpe shouldn't this use action_clear?
+                 case 0x90:                /* DCS */
+                         return VTE_TRANSITION(raw, DCS_ENTRY, action_dcs_start);
+@@ -521,6 +523,9 @@ protected:
+                                 case 0x5d: // ESC ]
+                                 case 0x9d: // OSC
+                                         return VTE_TRANSITION(raw, GROUND, action_osc_dispatch);
++                                case 0x5f: // ESC _
++                                case 0x9f: // APC
++                                        return VTE_TRANSITION(raw, GROUND, action_apc_dispatch);
+                                 case 0: // ignore
+                                         return VTE_TRANSITION(raw, GROUND, action_ignore);
+                                 }
+@@ -557,8 +562,9 @@ protected:
+                                 return VTE_TRANSITION(raw, OSC_STRING, action_osc_start);
+                         case 0x58:                /* 'X' */
+                         case 0x5e:                /* '^' */
+-                        case 0x5f:                /* '_' */
+                                 return VTE_TRANSITION(raw, ST_IGNORE, action_st_ignore_start);
++                        case 0x5f:                /* '_' */
++                                return VTE_TRANSITION(raw, APC_STRING, action_apc_start);
+                         case 0x9c:                /* ST */
+                                 return VTE_TRANSITION(raw, GROUND, action_execute);
+                         }
+@@ -756,6 +762,20 @@ protected:
+                         }
+ 
+                         return action_osc_collect(raw);
++                case APC_STRING:
++                        switch (raw) {
++                        case 0x00 ... 0x1a:        /* C0 \ { ESC } */
++                        case 0x1c ... 0x1f:
++                                return action_nop(raw);
++                        case 0x1b:                /* ESC */
++                                return VTE_TRANSITION_NO_ACTION(raw, ST_ESC);
++                        case 0x20 ... 0x7f:        /* [' ' - DEL] */
++                                return action_apc_collect(raw);
++                        case 0x9c:                /* ST */
++                                return VTE_TRANSITION(raw, GROUND, action_apc_dispatch);
++                        }
++
++                        return action_apc_collect(raw);
+                 case ST_IGNORE:
+                         switch (raw) {
+                         case 0x00 ... 0x1a:        /* ASCII \ { ESC } */
+@@ -1080,6 +1100,18 @@ protected:
+         }
+ 
+ 
++        inline int action_apc_collect(uint32_t raw) noexcept
++        {
++                /*
++                 * Only characters from 0x20..0x7e and >= 0xa0 are allowed here.
++                 * Our state-machine already verifies those restrictions.
++                 */
++                if (!vte_seq_string_push(&m_seq.arg_str, raw)) [[unlikely]]
++                        return VTE_TRANSITION(raw, ST_IGNORE, action_st_ignore_start);
++
++                return VTE_SEQ_NONE;
++        }
++
+         inline int action_osc_collect(uint32_t raw) noexcept
+         {
+                 /*
+@@ -1113,6 +1145,27 @@ protected:
+                 return VTE_SEQ_OSC;
+         }
+ 
++        inline int action_apc_dispatch(uint32_t raw) noexcept
++        {
++                /* m_seq is cleared during APC_START state, thus there's no need
++                 * to clear invalid fields here. */
++
++                vte_seq_string_finish(&m_seq.arg_str);
++
++                /* Only dispatch an APC if the introducer and string
++                 * terminator are from the same control set, i.e. both
++                 * C0 or both C1; we discard sequences with mixed controls.
++                 */
++                if (!check_matching_controls(m_seq.introducer, raw))
++                        return VTE_SEQ_IGNORE;
++
++                m_seq.type = VTE_SEQ_APC;
++                m_seq.command = VTE_CMD_APC;
++                m_seq.st = raw;
++
++                return VTE_SEQ_APC;
++        }
++
+         inline int action_osc_start(uint32_t raw) noexcept
+         {
+                 action_clear(raw);
+@@ -1124,6 +1177,17 @@ protected:
+                 return VTE_SEQ_NONE;
+         }
+ 
++        inline int action_apc_start(uint32_t raw) noexcept
++        {
++                action_clear(raw);
++
++                vte_seq_string_reset(&m_seq.arg_str);
++
++                m_seq.introducer = raw;
++
++                return VTE_SEQ_NONE;
++        }
++
+         inline int action_param(uint32_t raw) noexcept
+         {
+                 /* g_assert(raw >= '0' && raw <= '9'); */
 diff --git a/src/vte.cc b/src/vte.cc
-index 4f6b437..5f47d1d 100644
+index 4f6b437..c667beb 100644
 --- a/src/vte.cc
 +++ b/src/vte.cc
 @@ -953,6 +953,14 @@ Terminal::emit_paste_clipboard()
@@ -172,10 +381,77 @@ index 4f6b437..5f47d1d 100644
          if (m_screen == &m_normal_screen) {
                  queue_adjustment_value_changed(m_normal_screen.insert_delta);
                  adjust_adjustments_full();
-@@ -10035,6 +10058,108 @@ Terminal::widget_snapshot(GtkSnapshot* snapshot_object) noexcept
+@@ -9527,6 +9550,10 @@ Terminal::draw_rows(VteScreen *screen_,
+ 
+         m_draw.flush_background(bg_rect);
+ 
++        /* Kitty placements with a negative z index sit above the cell
++         * backgrounds but below the glyphs. */
++        draw_images (false, start_row, end_row - 1);
++
+         /* Render the text.
+          * The rect contains the area of the row (enlarged a bit at the top and bottom
+          * to allow the text to overdraw a bit), and is moved row-wise in the loop.
+@@ -10035,6 +10062,167 @@ Terminal::widget_snapshot(GtkSnapshot* snapshot_object) noexcept
  
  #endif /* VTE_GTK == 4 */
  
++/* Draw the inline images of the current screen.  @above_text selects the
++ * images with a non-negative z index, which are painted over the text; the
++ * others (Kitty's negative z) are painted from draw_rows() between the cell
++ * backgrounds and the glyphs. */
++void
++Terminal::draw_images(bool above_text,
++                      vte::grid::row_t first_row,
++                      vte::grid::row_t last_row) noexcept
++{
++        if (m_screen->images.empty ())
++                return;
++
++        auto const area_height = int(get_allocated_height () - m_border.top - m_border.bottom);
++        auto const area = vte::view::Rectangle{
++                0, 0,
++                int(m_column_count * m_cell_width),
++                area_height};
++        m_draw.clip_border (&area);
++
++        for (auto const& image : m_screen->images) {
++                if (above_text ? (image->z < 0) : (image->z >= 0))
++                        continue;
++
++                auto const rows = image_cell_rows (*image);
++                if (image->top + rows - 1 < long(first_row) ||
++                    image->top > long(last_row))
++                        continue;
++
++                auto const y = row_to_pixel (image->top);
++                if (y >= area_height || y + image->height <= 0)
++                        continue;
++
++#if VTE_GTK == 4
++                auto *texture = image->texture;
++                if (image->kitty_image_id != 0) {
++                        auto const it = m_kitty_images.find (image->kitty_image_id);
++                        if (it == m_kitty_images.end ())
++                                continue;
++                        texture = it->second->texture;
++                }
++
++                m_draw.draw_image_part (texture,
++                                        image->src_x,
++                                        image->src_y,
++                                        image->src_w,
++                                        image->src_h,
++                                        int(image->left * m_cell_width) + image->off_x,
++                                        int(y) + image->off_y,
++                                        image->draw_width,
++                                        image->draw_height);
++#endif
++        }
++
++        m_draw.unclip_border ();
++}
++
 +/* Number of grid rows an inline image currently spans.  Recomputed from the
 + * pixel height because the cell metrics can change (e.g. font size), and the
 + * image itself is stored in pixels. */
@@ -222,6 +498,9 @@ index 4f6b437..5f47d1d 100644
 +        auto const end = std::remove_if (screen_->images.begin (),
 +                                         screen_->images.end (),
 +                                         [this, first_row, end_row](auto const& image) {
++                                                 if (image->kitty_image_id != 0 &&
++                                                     m_kitty_images.find (image->kitty_image_id) == m_kitty_images.end ())
++                                                         return true;
 +                                                 return image->top + image_cell_rows (*image) - 1 < first_row ||
 +                                                        (end_row > first_row && image->top >= end_row);
 +                                         });
@@ -281,50 +560,40 @@ index 4f6b437..5f47d1d 100644
  void
  Terminal::draw(cairo_region_t const* region) noexcept
  {
-@@ -10104,6 +10229,42 @@ Terminal::draw(cairo_region_t const* region) noexcept
-                   m_cell_width,
-                   m_cell_height);
+@@ -10094,6 +10282,21 @@ Terminal::draw(cairo_region_t const* region) noexcept
+         /* Painting will flip this if it encounters any cell with blink attribute */
+         m_text_to_blink = false;
  
-+        /* Draw inline images (iTerm2 OSC 1337) on top of the text.  These live
-+         * in the screen's image list, anchored to absolute grid rows, so they
-+         * scroll with the content and are clipped to the text area here. */
++        /* Prepare the inline images before painting the rows: cull the ones
++         * that can no longer be seen, and order them by their z index (a
++         * stable sort keeps the insertion order of equal z values).  The
++         * image list is shared with the below-text pass in draw_rows(). */
 +        if (!m_screen->images.empty()) {
 +                images_cull (m_screen);
 +
-+                auto const area_height = allocated_height - m_border.top - m_border.bottom;
-+                auto const area = vte::view::Rectangle{
-+                        0, 0,
-+                        int(m_column_count * m_cell_width),
-+                        area_height};
-+                m_draw.clip_border (&area);
-+
-+                auto const last_row = last_displayed_row ();
-+                for (auto const& image : m_screen->images) {
-+                        auto const rows = image_cell_rows (*image);
-+                        if (image->top + rows - 1 < first_row ||
-+                            image->top > last_row)
-+                                continue;
-+
-+                        auto const y = row_to_pixel (image->top);
-+                        if (y >= area_height || y + image->height <= 0)
-+                                continue;
-+
-+#if VTE_GTK == 4
-+                        m_draw.draw_image (image->texture,
-+                                           int(image->left * m_cell_width) + image->off_x,
-+                                           int(y) + image->off_y,
-+                                           image->draw_width,
-+                                           image->draw_height);
-+#endif
-+                }
-+
-+                m_draw.unclip_border ();
++                if (m_screen->images.size () > 1)
++                        std::stable_sort (m_screen->images.begin (),
++                                          m_screen->images.end (),
++                                          [](auto const& a, auto const& b) {
++                                                  return a->z < b->z;
++                                          });
 +        }
++
+         /* and now paint them */
+         auto const first_row = first_displayed_row();
+         draw_rows(m_screen,
+@@ -10104,6 +10307,10 @@ Terminal::draw(cairo_region_t const* region) noexcept
+                   m_cell_width,
+                   m_cell_height);
+ 
++        /* Draw inline images (iTerm2 OSC 1337, and Kitty placements with a
++         * non-negative z) on top of the text. */
++        draw_images (true, first_row, last_displayed_row ());
 +
  	paint_im_preedit_string();
  
          m_draw.unclip_border();
-@@ -10762,6 +10923,10 @@ Terminal::reset(bool clear_tabstops,
+@@ -10762,6 +10969,11 @@ Terminal::reset(bool clear_tabstops,
  	/* Clear the scrollback buffers and reset the cursors. Switch to normal screen. */
  	if (clear_history) {
                  m_screen = &m_normal_screen;
@@ -332,26 +601,29 @@ index 4f6b437..5f47d1d 100644
 +                 * reset, so any inline images anchored to old rows are gone. */
 +                m_normal_screen.images.clear();
 +                m_alternate_screen.images.clear();
++                kitty_clear ();
                  m_normal_screen.scroll_delta = m_normal_screen.insert_delta =
                          m_normal_screen.row_data->reset();
                  m_normal_screen.cursor.row = m_normal_screen.insert_delta;
 diff --git a/src/vteinternal.hh b/src/vteinternal.hh
-index 4ba6357..fca4d43 100644
+index 4ba6357..aff83fc 100644
 --- a/src/vteinternal.hh
 +++ b/src/vteinternal.hh
-@@ -28,6 +28,11 @@
+@@ -28,6 +28,13 @@
  #endif
  
  #include <climits>
 +#include <charconv>
 +#include <memory>
++#include <string>
 +#include <string_view>
++#include <unordered_map>
 +#include <vector>
 +
  static_assert(CHAR_BIT == 8, "Weird");
  
  /* END sanity checks */
-@@ -139,6 +144,40 @@ typedef struct _VtePaletteColor {
+@@ -139,6 +146,73 @@ typedef struct _VtePaletteColor {
  	} sources[2];
  } VtePaletteColor;
  
@@ -378,6 +650,17 @@ index 4ba6357..fca4d43 100644
 +        int columns{1};       /* number of grid columns spanned when inserted */
 +        gsize bytes{0};       /* approximate texture memory, for accounting */
 +
++        /* Kitty graphics protocol placement.  When @kitty_image_id is non-zero
++         * the texture lives in the terminal's image store and is looked up at
++         * draw time instead of being owned by this placement. */
++        int z{0};                     /* paint order */
++        guint32 kitty_image_id{0};
++        guint32 kitty_placement_id{0};
++        int src_x{0};                 /* source rectangle in image pixels */
++        int src_y{0};
++        int src_w{0};                 /* 0 means "whole texture" */
++        int src_h{0};
++
 +        VteImage() = default;
 +        ~VteImage()
 +        {
@@ -389,10 +672,32 @@ index 4ba6357..fca4d43 100644
 +        VteImage& operator= (VteImage const&) = delete;
 +};
 +
++/* Image data of the Kitty graphics protocol, keyed by image id.  Placements
++ * reference it by id, so the same image can be shown several times. */
++struct VteKittyImage {
++#if VTE_GTK == 4
++        GdkTexture *texture{nullptr};
++#endif
++        int width{0};         /* native pixel dimensions */
++        int height{0};
++        gsize bytes{0};       /* approximate texture memory, for accounting */
++        guint64 seq{0};       /* insertion order, for LRU eviction */
++
++        VteKittyImage() = default;
++        ~VteKittyImage()
++        {
++#if VTE_GTK == 4
++                g_clear_object (&texture);
++#endif
++        }
++        VteKittyImage (VteKittyImage const&) = delete;
++        VteKittyImage& operator= (VteKittyImage const&) = delete;
++};
++
  struct VteScreen {
  public:
          VteScreen(gulong max_rows,
-@@ -159,6 +198,10 @@ public:
+@@ -159,6 +233,10 @@ public:
          double scroll_delta{0.0}; /* scroll offset */
          long insert_delta{0}; /* insertion offset */
  
@@ -403,7 +708,7 @@ index 4ba6357..fca4d43 100644
          /* Stuff saved along with the cursor */
          struct {
                  VteVisualPosition cursor;  /* onscreen coordinate, that is, relative to insert_delta */
-@@ -1429,6 +1472,8 @@ public:
+@@ -1429,6 +1507,8 @@ public:
                                  guint rows);
          void emit_copy_clipboard();
          void emit_paste_clipboard();
@@ -412,7 +717,7 @@ index 4ba6357..fca4d43 100644
          void emit_hyperlink_hover_uri_changed(const GdkRectangle *bbox);
  
          void hyperlink_invalidate_and_get_bbox(vte::base::Ring::hyperlink_idx_t idx, GdkRectangle *bbox);
-@@ -1789,6 +1834,29 @@ public:
+@@ -1789,6 +1869,56 @@ public:
          void vte_termprop(vte::parser::Sequence const& seq,
                            vte::parser::StringTokeniser::const_iterator& token,
                            vte::parser::StringTokeniser::const_iterator const& endtoken) noexcept;
@@ -421,14 +726,41 @@ index 4ba6357..fca4d43 100644
 +                                  vte::parser::StringTokeniser::const_iterator const& endtoken) noexcept;
 +        void iterm2_1337(vte::parser::Sequence const& seq,
 +                         std::string_view const& body) noexcept;
++        /* Terminal::APC() is declared by the generated parser-cmd-handlers.hh. */
++        void kitty_graphics(vte::parser::Sequence const& seq,
++                            std::string_view const& body) noexcept;
++        void kitty_clear() noexcept;
 +
 +        /* Inline image bookkeeping. */
 +        void images_clear_screen(VteScreen *screen_) noexcept;
 +        void images_cull(VteScreen *screen_) noexcept;
 +        void images_trim_memory(VteScreen *screen_) noexcept;
 +        void images_scroll_rows(long first_row, long last_row, long delta) noexcept;
++        void draw_images(bool above_text,
++                         vte::grid::row_t first_row,
++                         vte::grid::row_t last_row) noexcept;
 +        int image_cell_rows(VteImage const& image) const noexcept;
 +        int image_cell_columns(VteImage const& image) const noexcept;
++
++        /* Kitty graphics protocol state. */
++        struct KittyUpload {
++                guint32 id{0};
++                int format{0};
++                int width{0};
++                int height{0};
++                bool zlib{false};
++                bool place{false};
++                bool move_cursor{true};
++                std::string data{};
++        };
++
++        std::unordered_map<guint32, std::unique_ptr<VteKittyImage>> m_kitty_images{};
++        gsize m_kitty_images_bytes{0};
++        guint64 m_kitty_image_seq{0};
++        std::unique_ptr<KittyUpload> m_kitty_upload{};
++
++        static constexpr gsize kMaxKittyImages = 256;
++        static constexpr gsize kMaxKittyEncodedBytes = 64 * 1024 * 1024;
 +
 +        /* Limits, see docs/iterm2-inline-images.md §1.3. */
 +        static constexpr gsize kMaxImageEncodedBytes = 32 * 1024 * 1024;
@@ -443,7 +775,7 @@ index 4ba6357..fca4d43 100644
          void urxvt_extension(vte::parser::Sequence const& seq,
                               vte::parser::StringTokeniser::const_iterator& token,
 diff --git a/src/vteseq.cc b/src/vteseq.cc
-index 36ef93a..2f51ba9 100644
+index 36ef93a..d6cf67c 100644
 --- a/src/vteseq.cc
 +++ b/src/vteseq.cc
 @@ -165,6 +165,8 @@ Terminal::clear_screen()
@@ -465,7 +797,16 @@ index 36ef93a..2f51ba9 100644
          switch_screen(&m_normal_screen);
  }
  
-@@ -2001,6 +2006,365 @@ catch (...)
+@@ -281,6 +286,8 @@ Terminal::switch_screen(VteScreen *new_screen)
+ void
+ Terminal::switch_alternate_screen()
+ {
++        /* Entering the alternate screen starts from a clean slate. */
++        images_clear_screen (&m_alternate_screen);
+         switch_screen(&m_alternate_screen);
+ }
+ 
+@@ -2001,6 +2008,886 @@ catch (...)
          // nothing to do here
  }
  
@@ -828,10 +1169,531 @@ index 36ef93a..2f51ba9 100644
 +{
 +}
 +
++/* Drop all Kitty graphics image data and placements. */
++void
++Terminal::kitty_clear() noexcept
++{
++        m_kitty_upload.reset();
++        m_kitty_images.clear();
++        m_kitty_images_bytes = 0;
++
++        for (auto *screen_ : {&m_normal_screen, &m_alternate_screen}) {
++                auto& images = screen_->images;
++                images.erase (std::remove_if (images.begin (), images.end (),
++                                              [](auto const& image) {
++                                                      return image->kitty_image_id != 0;
++                                              }),
++                              images.end ());
++        }
++
++        invalidate_all ();
++}
++
++/* APC - application program command.
++ *
++ * VTE only dispatches APC for the Kitty graphics protocol, whose payload
++ * starts with 'G'.  Every other APC is ignored, as before this patch. */
++void
++Terminal::APC(vte::parser::Sequence const& seq)
++try
++{
++        auto const str = seq.string ();
++        if (str.empty () || str.front () != U'G')
++                return;
++
++        /* Narrow the payload; base64 and the control data are ASCII. */
++        auto body = std::string{};
++        body.reserve (str.size () - 1);
++        for (auto i = size_t{1}; i < str.size (); i++)
++                body.push_back (str[i] < 0x80 ? char(str[i]) : '\0');
++
++        kitty_graphics (seq, body);
++}
++catch (...)
++{
++}
++
++/* Kitty graphics protocol, see https://sw.kovidgoyal.net/kitty/graphics-protocol/
++ *
++ * Implemented subset: query (a=q), direct transmission (a=t, chunked with
++ * m=1, f=100/24/32, o=z), transmit-and-display (a=T, a=f), placement (a=p)
++ * and deletion (a=d).  File-based transports (t=f/t=t) are refused, and
++ * unknown actions are ignored. */
++void
++Terminal::kitty_graphics(vte::parser::Sequence const& seq,
++                         std::string_view const& body) noexcept
++try
++{
++#if VTE_GTK != 4
++        (void)seq;
++        (void)body;
++#else
++        auto const semicolon = body.find (';');
++        auto const control = body.substr (0, semicolon);
++        auto const payload = semicolon == std::string_view::npos
++                ? std::string_view{}
++                : body.substr (semicolon + 1);
++
++        /* Control data is a comma-separated list of key=value pairs. */
++        struct Param {
++                std::string_view key;
++                std::string_view value;
++        };
++        auto params = std::array<Param, 32>{};
++        auto n_params = size_t{0};
++
++        for (auto pos = size_t{0}; pos <= control.size (); ) {
++                auto const comma = control.find (',', pos);
++                auto const token = control.substr (pos, comma == std::string_view::npos
++                                                        ? std::string_view::npos
++                                                        : comma - pos);
++                pos = comma == std::string_view::npos ? control.size () + 1 : comma + 1;
++
++                if (token.empty ())
++                        continue;
++
++                auto const eq = token.find ('=');
++                if (eq == std::string_view::npos || eq == 0)
++                        continue;
++
++                if (n_params < params.size ())
++                        params[n_params++] = {token.substr (0, eq), token.substr (eq + 1)};
++        }
++
++        auto get = [&](std::string_view const& key) -> std::optional<std::string_view> {
++                /* Duplicate keys: the last one wins. */
++                for (auto i = n_params; i-- > 0; )
++                        if (params[i].key == key)
++                                return params[i].value;
++                return std::nullopt;
++        };
++
++        auto get_int = [&](std::string_view const& key, long fallback = 0) -> long {
++                auto const value = get (key);
++                if (!value || value->empty ())
++                        return fallback;
++
++                auto parsed = 0L;
++                auto const [ptr, ec] = std::from_chars (value->data (),
++                                                        value->data () + value->size (),
++                                                        parsed);
++                if (ec != std::errc () || ptr != value->data () + value->size ())
++                        return fallback;
++                return parsed;
++        };
++
++        auto const quiet_level = get_int ("q", 0);
++        auto const quiet_all = quiet_level == 2;   /* no replies at all */
++        auto const quiet_ok = quiet_all || quiet_level == 1; /* errors only */
++        auto const image_id = guint32 (std::max (0L, get_int ("i", 0)));
++        auto const placement_id = guint32 (std::max (0L, get_int ("p", 0)));
++
++        auto reply_with = [&](std::string const& text, bool is_ok) {
++                if (is_ok ? quiet_ok : quiet_all)
++                        return;
++                auto builder = vte::parser::u8SequenceBuilder{VTE_SEQ_APC};
++                builder.set_string ("G" + text);
++                reply (seq, builder);
++        };
++        auto reply_ok = [&](guint32 id) {
++                reply_with (id != 0 ? "i=" + std::to_string (id) + ";OK" : std::string{"OK"}, true);
++        };
++        auto reply_error = [&](guint32 id, char const* code) {
++                reply_with (id != 0 ? "i=" + std::to_string (id) + ";" + code : std::string{code}, false);
++        };
++
++        auto const action = get ("a");
++        auto const action_char = action && !action->empty () ? action->front () : 't';
++
++        /* ---- query ---- */
++        if (action_char == 'q') {
++                reply_ok (image_id);
++                return;
++        }
++
++        /* ---- placement ---- */
++        if (action_char == 'p') {
++                auto const it = m_kitty_images.find (image_id);
++                if (it == m_kitty_images.end ()) {
++                        reply_error (image_id, "ENOENT:no such image");
++                        return;
++                }
++
++                auto const& stored = *it->second;
++                auto const cell_width = int(m_cell_width);
++                auto const cell_height = int(m_cell_height);
++                auto const scale = double(std::max (1, m_draw.scale_factor ()));
++                if (cell_width <= 0 || cell_height <= 0)
++                        return;
++
++                /* Source rectangle, in image pixels. */
++                auto source_x = std::max (0, int(std::min<long> (get_int ("x", 0), INT_MAX)));
++                auto source_y = std::max (0, int(std::min<long> (get_int ("y", 0), INT_MAX)));
++                auto source_w = int(std::min<long> (get_int ("w", 0), INT_MAX));
++                auto source_h = int(std::min<long> (get_int ("h", 0), INT_MAX));
++                if (source_w <= 0)
++                        source_w = stored.width - source_x;
++                if (source_h <= 0)
++                        source_h = stored.height - source_y;
++                source_w = std::min (source_w, stored.width - source_x);
++                source_h = std::min (source_h, stored.height - source_y);
++                if (source_w <= 0 || source_h <= 0)
++                        return;
++
++                /* Target box, in cells.  With neither key the image keeps its
++                 * natural size; with one the other follows the source aspect;
++                 * with both the bitmap is letterboxed inside the box. */
++                auto columns = int(get_int ("c", 0));
++                auto rows = int(get_int ("r", 0));
++                auto draw_w = 0;
++                auto draw_h = 0;
++                auto off_x = 0;
++                auto off_y = 0;
++
++                if (columns <= 0 && rows <= 0) {
++                        /* Natural size: one image pixel per device pixel. */
++                        draw_w = std::max (1, int(std::lround (double(source_w) / scale)));
++                        draw_h = std::max (1, int(std::lround (double(source_h) / scale)));
++                        columns = (draw_w + cell_width - 1) / cell_width;
++                        rows = (draw_h + cell_height - 1) / cell_height;
++                } else if (columns > 0 && rows <= 0) {
++                        auto const box_w = double(columns) * cell_width;
++                        rows = std::max (1, int(std::ceil (box_w * double(source_h) /
++                                                           (double(source_w) * cell_height))));
++                } else if (rows > 0 && columns <= 0) {
++                        auto const box_h = double(rows) * cell_height;
++                        columns = std::max (1, int(std::ceil (box_h * double(source_w) /
++                                                              (double(source_h) * cell_width))));
++                }
++                columns = std::clamp (columns, 1, 4096);
++                rows = std::clamp (rows, 1, 4096);
++
++                auto const box_w = columns * cell_width;
++                auto const box_h = rows * cell_height;
++
++                if (draw_w <= 0) {
++                        auto const s = std::min (double(box_w) / double(source_w),
++                                                 double(box_h) / double(source_h));
++                        draw_w = std::max (1, int(std::lround (double(source_w) * s)));
++                        draw_h = std::max (1, int(std::lround (double(source_h) * s)));
++                        off_x = (box_w - draw_w) / 2;
++                        off_y = (box_h - draw_h) / 2;
++                }
++
++                auto image = std::make_unique<VteImage>();
++                image->top = m_screen->cursor.row;
++                image->left = m_screen->cursor.col;
++                image->width = box_w;
++                image->height = box_h;
++                image->draw_width = draw_w;
++                image->draw_height = draw_h;
++                image->off_x = off_x;
++                image->off_y = off_y;
++                image->src_x = source_x;
++                image->src_y = source_y;
++                image->src_w = source_w;
++                image->src_h = source_h;
++                image->rows = rows;
++                image->columns = columns;
++                image->z = int(std::clamp<long> (get_int ("z", 0), INT_MIN / 2, INT_MAX / 2));
++                image->kitty_image_id = image_id;
++                image->kitty_placement_id = placement_id;
++                image->bytes = 0;
++
++                auto const no_move_cursor = get_int ("C", 0) == 1;
++                auto const insert_row = image->top;
++                auto const insert_col = image->left;
++
++                /* Re-using the same (image, placement) pair replaces the
++                 * previous placement instead of stacking a duplicate. */
++                if (placement_id != 0) {
++                        auto& existing = m_screen->images;
++                        existing.erase (std::remove_if (existing.begin (), existing.end (),
++                                                        [&](auto const& other) {
++                                                                return other->kitty_image_id == image_id &&
++                                                                       other->kitty_placement_id == placement_id;
++                                                        }),
++                                        existing.end ());
++                }
++
++                m_screen->images.push_back (std::move (image));
++
++                if (!no_move_cursor) {
++                        for (auto i = 1; i < rows; i++)
++                                cursor_down_with_scrolling (true);
++                        m_screen->cursor.col = std::min<long> (m_screen->cursor.col + columns,
++                                                               m_column_count - 1);
++                        m_screen->cursor_advanced_by_graphic_character = false;
++                } else {
++                        /* Placements never scroll; keep the cursor put. */
++                        m_screen->cursor.row = insert_row;
++                        m_screen->cursor.col = insert_col;
++                }
++
++                invalidate_all ();
++                reply_ok (image_id);
++                return;
++        }
++
++        /* ---- deletion ---- */
++        if (action_char == 'd') {
++                /* A delete command aborts any partially received image. */
++                m_kitty_upload.reset ();
++
++                auto const what = get ("d");
++                auto const kind = what && !what->empty () ? what->front () : 'a';
++
++                /* Kitty places images on a plane that belongs to the screen;
++                 * deletions apply to the visible screen. */
++                auto should_delete = [&](VteImage const& image) {
++                        switch (kind) {
++                        case 'a':
++                        case 'A':
++                                return true;
++                        case 'i':
++                        case 'I':
++                                return image.kitty_image_id == image_id &&
++                                       (placement_id == 0 || image.kitty_placement_id == placement_id);
++                        default:
++                                /* 'p'/'P' select by cell intersection, which is
++                                 * not implemented; ignore the command. */
++                                return false;
++                        }
++                };
++
++                auto& images = m_screen->images;
++                images.erase (std::remove_if (images.begin (), images.end (),
++                                              [&](auto const& image) {
++                                                      return image->kitty_image_id != 0 &&
++                                                             should_delete (*image);
++                                              }),
++                              images.end ());
++
++                if (kind == 'A') {
++                        m_kitty_images.clear ();
++                        m_kitty_images_bytes = 0;
++                } else if (kind == 'I') {
++                        if (auto const it = m_kitty_images.find (image_id);
++                            it != m_kitty_images.end ()) {
++                                m_kitty_images_bytes -= it->second->bytes;
++                                m_kitty_images.erase (it);
++                        }
++                }
++
++                invalidate_all ();
++                reply_ok (image_id);
++                return;
++        }
++
++        /* ---- transmission ---- */
++        if (action_char != 't' && action_char != 'T' && action_char != 'f' &&
++            !(action == std::nullopt && m_kitty_upload != nullptr))
++                return;
++
++        if (action && (action_char == 't' || action_char == 'T' || action_char == 'f')) {
++                auto const transport = get ("t");
++                if (transport && *transport != "d") {
++                        /* File and temporary-file transports are not supported. */
++                        reply_error (image_id, "ENOTSUP:only direct transmission");
++                        return;
++                }
++
++                auto upload = std::make_unique<KittyUpload> ();
++                upload->id = image_id;
++                upload->format = int(get_int ("f", 32));
++                upload->width = int(std::clamp<long> (get_int ("s", 0), 0, INT_MAX));
++                upload->height = int(std::clamp<long> (get_int ("v", 0), 0, INT_MAX));
++                upload->zlib = get ("o") == std::optional<std::string_view>{"z"};
++                upload->place = action_char != 't';
++                upload->move_cursor = action_char != 'f';
++                m_kitty_upload = std::move (upload);
++        }
++
++        auto *upload = m_kitty_upload.get ();
++        if (upload == nullptr)
++                return;
++
++        auto const more = get_int ("m", 0) != 0;
++
++        /* Each chunk is separately base64 encoded. */
++        if (!payload.empty ()) {
++                auto const encoded = std::string{payload};
++                auto decoded_len = gsize{0};
++                g_autofree guchar *decoded = g_base64_decode (encoded.c_str (), &decoded_len);
++                if (decoded == nullptr || decoded_len == 0) {
++                        auto const id = upload->id;
++                        m_kitty_upload.reset ();
++                        reply_error (id, "EINVAL:invalid base64");
++                        return;
++                }
++                if (upload->data.size () + decoded_len > kMaxKittyEncodedBytes) {
++                        auto const id = upload->id;
++                        m_kitty_upload.reset ();
++                        reply_error (id, "ENOSPC:payload too large");
++                        return;
++                }
++                upload->data.append (reinterpret_cast<char const*> (decoded), decoded_len);
++        }
++
++        if (more)
++                return;
++
++
++        /* Assemble the image. */
++        auto data = std::move (upload->data);
++        auto const id = upload->id;
++        auto const format = upload->format;
++        auto const declared_width = upload->width;
++        auto const declared_height = upload->height;
++        auto const compress = upload->zlib;
++        auto const place = upload->place;
++        auto const move_cursor = upload->move_cursor;
++        m_kitty_upload.reset ();
++
++        if (compress) {
++                g_autoptr(GZlibDecompressor) decompressor = g_zlib_decompressor_new (G_ZLIB_COMPRESSOR_FORMAT_ZLIB);
++                g_autoptr(GInputStream) memory = g_memory_input_stream_new_from_data (data.data (), data.size (), nullptr);
++                g_autoptr(GInputStream) stream = g_converter_input_stream_new (memory, G_CONVERTER (decompressor));
++                auto out = std::string{};
++                auto buffer = std::array<guint8, 65536>{};
++                for (;;) {
++                        auto const n = g_input_stream_read (stream, buffer.data (), buffer.size (), nullptr, nullptr);
++                        if (n <= 0)
++                                break;
++                        if (out.size () + gsize(n) > kMaxKittyEncodedBytes)
++                                break;
++                        out.append (reinterpret_cast<char const*> (buffer.data ()), gsize(n));
++                }
++                data = std::move (out);
++        }
++
++        if (data.empty ())
++                return;
++
++        g_autoptr(GdkTexture) texture = nullptr;
++        auto width = declared_width;
++        auto height = declared_height;
++
++        if (format == 100) {
++                g_autoptr(GBytes) bytes = g_bytes_new (data.data (), data.size ());
++                g_autoptr(GError) error = nullptr;
++                texture = gdk_texture_new_from_bytes (bytes, &error);
++                if (texture == nullptr)
++                        return;
++                width = int(gdk_texture_get_width (texture));
++                height = int(gdk_texture_get_height (texture));
++        } else if (format == 24 || format == 32) {
++                if (width <= 0 || height <= 0)
++                        return;
++
++                auto const bpp = format == 24 ? 3u : 4u;
++                auto const stride = gsize(width) * bpp;
++                if (gsize(height) * stride > data.size ())
++                        return;
++
++                g_autoptr(GBytes) bytes = g_bytes_new (data.data (), gsize(height) * stride);
++                texture = gdk_memory_texture_new (width, height,
++                                                  format == 24 ? GDK_MEMORY_R8G8B8
++                                                               : GDK_MEMORY_R8G8B8A8,
++                                                  bytes,
++                                                  stride);
++        } else {
++                return;
++        }
++
++        if (texture == nullptr || width <= 0 || height <= 0)
++                return;
++
++        auto const decoded_bytes = gsize(width) * gsize(height) * 4u;
++        if (guint64(width) * guint64(height) > kMaxImagePixels ||
++            decoded_bytes > kMaxImageBytes)
++                return;
++
++        auto const new_id = id != 0 ? id : guint32(++m_kitty_image_seq);
++
++        /* Replacing an image id replaces the data. */
++        if (auto const it = m_kitty_images.find (new_id); it != m_kitty_images.end ()) {
++                m_kitty_images_bytes -= it->second->bytes;
++                m_kitty_images.erase (it);
++        }
++
++        auto stored = std::make_unique<VteKittyImage> ();
++        stored->texture = g_steal_pointer (&texture);
++        stored->width = width;
++        stored->height = height;
++        stored->bytes = decoded_bytes;
++        stored->seq = ++m_kitty_image_seq;
++        m_kitty_images_bytes += decoded_bytes;
++        m_kitty_images[new_id] = std::move (stored);
++
++        /* Bound the store: evict the oldest images (and their placements). */
++        while (!m_kitty_images.empty () &&
++               (m_kitty_images_bytes > kMaxImagesBytes ||
++                m_kitty_images.size () > kMaxKittyImages)) {
++                auto oldest = m_kitty_images.begin ();
++                for (auto it = m_kitty_images.begin (); it != m_kitty_images.end (); ++it)
++                        if (it->second->seq < oldest->second->seq)
++                                oldest = it;
++
++                auto const victim = oldest->first;
++                m_kitty_images_bytes -= oldest->second->bytes;
++                m_kitty_images.erase (oldest);
++
++                for (auto *screen_ : {&m_normal_screen, &m_alternate_screen}) {
++                        auto& images = screen_->images;
++                        images.erase (std::remove_if (images.begin (), images.end (),
++                                                      [victim](auto const& image) {
++                                                              return image->kitty_image_id == victim;
++                                                      }),
++                                      images.end ());
++                }
++        }
++
++        /* a=T / a=f also display the image at the cursor. */
++        if (place) {
++                auto const cell_width = int(m_cell_width);
++                auto const cell_height = int(m_cell_height);
++                auto const scale = double(std::max (1, m_draw.scale_factor ()));
++                if (cell_width > 0 && cell_height > 0) {
++                        auto const natural_w = std::max (1, int(std::lround (double(width) / scale)));
++                        auto const natural_h = std::max (1, int(std::lround (double(height) / scale)));
++                        auto const columns = std::max (1, (natural_w + cell_width - 1) / cell_width);
++                        auto const rows = std::max (1, (natural_h + cell_height - 1) / cell_height);
++
++                        auto image = std::make_unique<VteImage> ();
++                        image->top = m_screen->cursor.row;
++                        image->left = m_screen->cursor.col;
++                        image->width = columns * cell_width;
++                        image->height = rows * cell_height;
++                        image->draw_width = natural_w;
++                        image->draw_height = natural_h;
++                        image->rows = rows;
++                        image->columns = columns;
++                        image->kitty_image_id = new_id;
++                        m_screen->images.push_back (std::move (image));
++
++                        if (move_cursor) {
++                                for (auto i = 1; i < rows; i++)
++                                        cursor_down_with_scrolling (true);
++                                m_screen->cursor.col = std::min<long> (m_screen->cursor.col + columns,
++                                                                       m_column_count - 1);
++                                m_screen->cursor_advanced_by_graphic_character = false;
++                        }
++                }
++        }
++
++        invalidate_all ();
++        reply_ok (new_id);
++#endif /* VTE_GTK == 4 */
++}
++catch (...)
++{
++}
++
  void
  Terminal::urxvt_extension(vte::parser::Sequence const& seq,
                            vte::parser::StringTokeniser::const_iterator& token,
-@@ -7753,6 +8117,14 @@ try
+@@ -7753,6 +8640,14 @@ try
                  conemu_extension(seq, it, cend);
                  break;
  
@@ -846,7 +1708,7 @@ index 36ef93a..2f51ba9 100644
          case VTE_OSC_XTERM_SET_ICON_TITLE:
          case VTE_OSC_XTERM_SET_XPROPERTY:
          case VTE_OSC_XTERM_SET_COLOR_MOUSE_CURSOR_FG:
-@@ -7763,7 +8135,6 @@ try
+@@ -7763,7 +8658,6 @@ try
          case VTE_OSC_XTERM_SET_CURSOR_NAME:
          case VTE_OSC_XTERM_LOGFILE:
          case VTE_OSC_XTERM_SET_FONT:
@@ -854,7 +1716,7 @@ index 36ef93a..2f51ba9 100644
          case VTE_OSC_XTERM_SET_COLOR_MODE:
          case VTE_OSC_XTERM_RESET_COLOR_MOUSE_CURSOR_FG:
          case VTE_OSC_XTERM_RESET_COLOR_MOUSE_CURSOR_BG:
-@@ -7771,7 +8142,6 @@ try
+@@ -7771,7 +8665,6 @@ try
          case VTE_OSC_XTERM_RESET_COLOR_TEK_BG:
          case VTE_OSC_XTERM_RESET_COLOR_TEK_CURSOR:
          case VTE_OSC_EMACS_51:
