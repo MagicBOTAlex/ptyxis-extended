@@ -66,7 +66,7 @@ python3 scripts/lib/kitty_fixtures.py --selftest
 | `geometry-source-rect` | `x,y,w,h` crop selects only the blue right half |
 | `geometry-cursor` | `C=1` leaves the cursor unchanged; the default-cursor policy is recorded (this build leaves it on the image's last row; spec §8 says right c / down r — INFO, OpenTUI uses C=1) |
 | `geometry-zorder` | z=2 over z=1; deleting the top placement reveals the lower one |
-| `zorder-text` | negative z draws behind glyphs (text legible); z≥0 covers them |
+| `zorder-text` | positive control with three disjoint opaque 180×180 images of the same id: z=-1 keeps text visible inside the image, z=0 and z=1 fully cover it (green=0; text printed **after** placement, measured only inside each image rect) |
 | `geometry-multi-placement` | one image id placed twice at different cells |
 | `delete-image-id` | `d=i` removes placements but keeps data (re-place works); `d=I` frees data (re-place no-op) |
 | `delete-placement` | `d=i,i=..,p=..` removes only that placement |
@@ -76,7 +76,7 @@ python3 scripts/lib/kitty_fixtures.py --selftest
 | `lifecycle-resize` | shrink/grow alive, placement remains |
 | `lifecycle-clear` | ED2+ED3 clears images |
 | `lifecycle-altscreen` | alt screen images independent; primary restored on exit |
-| `reply-default` | with q absent, transmit/placement produce OK replies (spec C5); guards the q=2 silence test from being vacuous |
+| `reply-default` | dumps the exact controls: default flow has **no `q=`**, plus an explicit `q=0` flow. Asserts OK replies for both (C5); also documents that the shared `emit_kitty.py` defaults non-probe frames to `q=2` and is unsuitable for this test |
 | `quiet-q2` | after a successful probe, q=2 transmit/place/delete produce no replies |
 | `shared-emitter-render` | team emitter bytes: probe identical, `--verify` clean, image renders |
 | `memory-images` | 100 × 100 kB chunked transmit/place/delete: alive, RSS bounded, no leak, still responsive |
@@ -102,6 +102,10 @@ python3 scripts/lib/kitty_fixtures.py --selftest
   fails (no probe reply, zero image pixels), while `envelope-forms`
   (`wire-only`), `control-stock-vte`, `iterm2-regression` and (optionally)
   `opentui-demo` SKIP/FAIL as expected.
+- `zorder-text` positions every placement with an explicit CSI H anchor and prints
+  the green text after placement, confined to the image rectangle. (An earlier
+  variant printed text first and left the cursor on the last text row, so the
+  image was anchored there and the measurement was misleading.)
 - APC frame ceiling: this agent found that the terminal caps the whole APC frame
   at 4096 characters, so a 4096-character base64 chunk plus its control data is
   dropped. OpenTUI splits at 3072 raw bytes = exactly 4096 base64 chars, so

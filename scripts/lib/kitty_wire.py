@@ -48,6 +48,12 @@ def src_tuple(value):
     return parts
 
 
+def q_value(a):
+    if getattr(a, "q", None) is not None:
+        return str(a.q)
+    return "2" if getattr(a, "quiet", False) else None
+
+
 def placement_kwargs(a):
     kw = {}
     if a.placement_id is not None:
@@ -81,6 +87,7 @@ def main(argv):
 
     p = sub.add_parser("png")
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--q", type=int, choices=(0, 1, 2))
     p.add_argument("file")
     p.add_argument("--image-id", type=int, required=True)
     p.add_argument("--action", default="t")
@@ -95,6 +102,7 @@ def main(argv):
 
     p = sub.add_parser("raw")
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--q", type=int, choices=(0, 1, 2))
     p.add_argument("--chunk", type=int, default=4096)
     p.add_argument("--width", type=int, required=True)
     p.add_argument("--height", type=int, required=True)
@@ -107,6 +115,7 @@ def main(argv):
 
     p = sub.add_parser("place")
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--q", type=int, choices=(0, 1, 2))
     p.add_argument("--image-id", type=int, required=True)
     p.add_argument("--placement-id", type=int)
     p.add_argument("--columns", type=int)
@@ -118,6 +127,7 @@ def main(argv):
 
     p = sub.add_parser("delete")
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--q", type=int, choices=(0, 1, 2))
     p.add_argument("--mode", required=True, choices=("i", "I", "p", "a"))
     p.add_argument("--image-id", type=int)
     p.add_argument("--placement-id", type=int)
@@ -150,8 +160,9 @@ def main(argv):
     k, _path = load_emitter()
     if a.cmd == "png":
         extra = placement_kwargs(a)
-        if a.quiet:
-            extra["q"] = "2"
+        qv = q_value(a)
+        if qv is not None:
+            extra["q"] = qv
         data = k.png_frames(a.file, action=a.action, image_id=a.image_id,
                             chunk_size=a.chunk, extra=extra or None,
                             **({"placement_id": a.placement_id} if a.placement_id is not None else {}))
@@ -162,13 +173,13 @@ def main(argv):
         data = k.raw_frames(a.width, a.height, raw, a.format, action=a.action,
                             image_id=a.image_id, zlib_compress=a.zlib,
                             chunk_size=a.chunk,
-                            extra={"q": "2"} if a.quiet else None)
+                            extra=({"q": q_value(a)} if q_value(a) else None))
         write_out(data, a.out)
         return 0
     if a.cmd == "place":
         kw = placement_kwargs(a)
-        if a.quiet:
-            kw["extra"] = {"q": "2"}
+        if q_value(a):
+            kw["extra"] = {"q": q_value(a)}
         data = k.placement(image_id=a.image_id, **kw)
         write_out(data, a.out)
         return 0
@@ -178,8 +189,8 @@ def main(argv):
             kw["image_id"] = a.image_id
         if a.placement_id is not None:
             kw["placement_id"] = a.placement_id
-        if a.quiet:
-            kw["extra"] = {"q": "2"}
+        if q_value(a):
+            kw["extra"] = {"q": q_value(a)}
         data = k.delete(mode=a.mode, **kw)
         write_out(data, a.out)
         return 0

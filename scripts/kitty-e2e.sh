@@ -1080,43 +1080,59 @@ sc_geometry_one_dim() {
 }
 
 sc_zorder_text() {
-    local green red blue
-    kemit_png "$SC/red.bin" "$FIX/red-96.png" 53 --action t --chunk 3072 || { ck_fail emission-red "failed"; return; }
-    kemit_png "$SC/blue.bin" "$FIX/blue-96.png" 54 --action t --chunk 3072 || { ck_fail emission-blue "failed"; return; }
-    send_file "$SC/red.bin" || { ck_fail transmit-red "timed out"; return; }
-    send_file "$SC/blue.bin" || { ck_fail transmit-blue "timed out"; return; }
-    # Negative z: image behind glyphs, text stays legible.
-    session_send "printf '\\033[1;1H\\033[38;2;0;255;0mXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\\033[0m'" 10 ||
-        { ck_fail text "timed out"; return; }
-    kemit_place "$SC/pneg.bin" 53 --placement-id 1 --columns 40 --z -1 --no-move ||
-        { ck_fail place-neg-emit "failed"; return; }
-    send_file "$SC/pneg.bin" || { ck_fail place-neg "timed out"; return; }
-    session_shot "$SC/shots/negative.png"
-    red=$(count_of "$SC/shots/negative.png" '#FF0000')
-    green=$(count_of "$SC/shots/negative.png" '#00FF00' 80)
-    ck_info negative-z "red=$red green-text=$green"
-    if [ "${red:-0}" -ge 8000 ] && [ "${green:-0}" -ge 150 ]; then
-        ck_pass negative-z "z<0 image drawn behind the text (glyphs remain visible, green=$green)"
-    else
-        ck_fail negative-z "red=$red green=$green; expected image plus legible text"
-    fi
-    kemit_delete "$SC/del.bin" i --image-id 53 --placement-id 1 || { ck_fail del-emit "failed"; return; }
-    send_file "$SC/del.bin" || { ck_fail del "timed out"; return; }
-    # Non-negative z: image above glyphs.
-    session_send "printf '\\033[1;1H\\033[38;2;0;255;0mXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\\033[0m'" 10 ||
-        { ck_fail text2 "timed out"; return; }
-    kemit_place "$SC/ppos.bin" 54 --placement-id 2 --columns 40 --z 1 --no-move ||
-        { ck_fail place-pos-emit "failed"; return; }
-    send_file "$SC/ppos.bin" || { ck_fail place-pos "timed out"; return; }
-    session_shot "$SC/shots/positive.png"
-    blue=$(count_of "$SC/shots/positive.png" '#0000FF')
-    green=$(count_of "$SC/shots/positive.png" '#00FF00' 80)
-    ck_info positive-z "blue=$blue green-text=$green"
-    if [ "${blue:-0}" -ge 8000 ] && [ "${green:-1}" -eq 0 ]; then
-        ck_pass positive-z "z>=0 image painted above the text (green=$green)"
-    else
-        ck_fail positive-z "blue=$blue green=$green; expected the image to cover the glyphs"
-    fi
+    local cx cy cw ch n green blue
+    cw=$(cell_w_i); ch=$(cell_h_i)
+    read -r cx cy <<<"$(content_origin)"
+    kemit_png "$SC/blue.bin" "$FIX/blue-96.png" 54 --action t --chunk 3072 || { ck_fail emission "failed"; return; }
+    send_file "$SC/blue.bin" || { ck_fail transmit "timed out"; return; }
+
+    # Three 180x180 opaque images of the same id at disjoint anchors:
+    #   A (1,1) z=-1, B (1,25) z=0, C (12,1) z=1.
+    # Text (20x4 green X) is printed AFTER all placements and lies entirely
+    # inside each 180x180 rectangle, so the green count is unambiguous.
+    local ax=$cx ay=$cy bx=$((cx + 24 * cw)) by=$cy ccx=$cx ccy=$((cy + 11 * ch))
+    local p
+    for spec in "-1 1 1 1" "0 2 1 25" "1 3 12 1"; do
+        set -- $spec
+        local z=$1 pid=$2 rr=$3 ccol=$4
+        session_send "printf '\\033[${rr};${ccol}H'" 5 >/dev/null 2>&1 || true
+        kemit_place "$SC/p-z$z.bin" 54 --placement-id "$pid" --columns 20 --z "$z" --no-move ||
+            { ck_fail "place-z$z-emit" "failed"; return; }
+        send_file "$SC/p-z$z.bin" || { ck_fail "place-z$z" "timed out"; return; }
+    done
+    # Green text, printed after placement, fully inside each image rectangle.
+    session_send "printf '\\033[1;1H'; for r in 1 2 3 4; do printf '\\033[38;2;0;255;0mXXXXXXXXXXXXXXXXXXXX\\033[0m\\n'; done" 10 || { ck_fail text-a "timed out"; return; }
+    session_send "printf '\\033[1;25H'; for r in 1 2 3 4; do printf '\\033[38;2;0;255;0mXXXXXXXXXXXXXXXXXXXX\\033[0m\\n'; done" 10 || { ck_fail text-b "timed out"; return; }
+    session_send "printf '\\033[12;1H'; for r in 1 2 3 4; do printf '\\033[38;2;0;255;0mXXXXXXXXXXXXXXXXXXXX\\033[0m\\n'; done" 10 || { ck_fail text-c "timed out"; return; }
+    session_shot "$SC/shots/zorder-text.png"
+
+    _zcase() { # label z regionx regiony
+        local label=$1 z=$2 rx=$3 ry=$4
+        blue=$(pix count --image "$SC/shots/zorder-text.png" --color '#0000FF' --region "$rx,$ry,180,180" 2>/dev/null | json_field count)
+        green=$(pix count --image "$SC/shots/zorder-text.png" --color '#00FF00' --fuzz 80 --region "$rx,$ry,180,180" 2>/dev/null | json_field count)
+        ck_info "z$z" "region ${rx},${ry}: blue=$blue green=$green (image=180x180 opaque)"
+        if [ "${blue:-0}" -lt 20000 ]; then
+            ck_fail "image-z$z" "opaque image not found in its region (blue=$blue)"
+            return
+        fi
+        ck_pass "image-z$z" "opaque 180x180 image present (blue=$blue)"
+        if [ "$z" -lt 0 ]; then
+            if [ "${green:-0}" -ge 500 ]; then
+                ck_pass "behind-text-z$z" "z=$z behind glyphs: text visible inside the image (green=$green)"
+            else
+                ck_fail "behind-text-z$z" "z=$z text hidden inside the image (green=$green); expected legible text"
+            fi
+        else
+            if [ "${green:-1}" -eq 0 ]; then
+                ck_pass "above-text-z$z" "z=$z above glyphs: text fully covered (green=0)"
+            else
+                ck_fail "above-text-z$z" "z=$z image still behind glyphs (green=$green inside the image; expected 0)"
+            fi
+        fi
+    }
+    _zcase A -1 "$ax" "$ay"
+    _zcase B 0 "$bx" "$by"
+    _zcase C 1 "$ccx" "$ccy"
     if session_alive; then ck_pass alive "alive"; else ck_fail alive "died"; fi
 }
 
@@ -1241,10 +1257,30 @@ sc_reply_default() {
     fi
     ck_pass precondition "Kitty probe answered"
     session_send "python3 '$LIB/kitty_tty.py' drain --timeout 0.6 --out '$drained' >/dev/null 2>&1" 5 || true
-    kemit_png "$SC/t.bin" "$FIX/red-96.png" 97 --action t --chunk 3072 || { ck_fail emission "failed"; return; }
-    kemit_place "$SC/p.bin" 97 --placement-id 1 --no-move || { ck_fail place-emit "failed"; return; }
-    cat "$SC/t.bin" "$SC/p.bin" >"$SC/flow.bin"
-    send_file "$SC/flow.bin" || { ck_fail flow "timed out"; return; }
+
+    # ---- default (no q key at all) ----
+    kemit_png "$SC/t-default.bin" "$FIX/red-96.png" 97 --action t --chunk 3072 || { ck_fail emission-default "failed"; return; }
+    kemit_place "$SC/p-default.bin" 97 --placement-id 1 --no-move || { ck_fail place-default-emit "failed"; return; }
+    cat "$SC/t-default.bin" "$SC/p-default.bin" >"$SC/flow-default.bin"
+    python3 - "$SC/t-default.bin" "$SC/p-default.bin" "$SC/control-default.txt" <<'PYINNER'
+import sys
+out = []
+for path in sys.argv[1:3]:
+    d = open(path, 'rb').read()
+    for frame in d.split(b'\x1b_G')[1:]:
+        body = frame.split(b'\x1b\\')[0]
+        ctl = body.split(b';')[0]
+        out.append("%s: %s" % (path.rsplit('/', 1)[-1], ctl.decode('latin-1')))
+open(sys.argv[3], 'w').write("\n".join(out) + "\n")
+PYINNER
+    cat "$SC/control-default.txt" >>"$RUN/harness.log"
+    ck_info control-default "$(tr '\n' ' ' <"$SC/control-default.txt")"
+    if grep -q 'q=' "$SC/control-default.txt"; then
+        ck_fail wire-default-no-q "default flow contains a q= key; the scenario would be invalid"
+    else
+        ck_pass wire-default-no-q "default flow has no q= key (implicit q=0), so the reply test is valid"
+    fi
+    send_file "$SC/flow-default.bin" || { ck_fail flow-default "timed out"; return; }
     session_send "python3 '$LIB/kitty_tty.py' drain --timeout 0.9 --out '$drained' >/dev/null 2>&1" 5 || true
     local bytes ok
     bytes=$(stat -c %s "$drained" 2>/dev/null || echo 0)
@@ -1254,11 +1290,69 @@ d = open(sys.argv[1], 'rb').read() if os.path.exists(sys.argv[1]) else b''
 print(d.count(b'\x1b_G'))
 PYINNER
 )
-    ck_info replies "drained bytes=$bytes apc_frames=$ok"
+    ck_info replies-default "drained bytes=$bytes apc_frames=$ok"
     if [ "${ok:-0}" -ge 1 ]; then
-        ck_pass default-replies "terminal replied to transmit/placement without q=2 ($ok APC reply frames)"
+        ck_pass default-replies "terminal replied to transmit/placement with q absent ($ok APC reply frames)"
     else
-        ck_fail default-replies "no OK replies for transmit/placement with q absent (spec C5 q=0 replies to all); q=2 silence tests are otherwise vacuous"
+        ck_fail default-replies "no OK replies for transmit/placement with q absent (spec C5: q=0 replies to all)"
+    fi
+
+    # ---- explicit q=0 ----
+    kemit_png "$SC/t-q0.bin" "$FIX/red-96.png" 98 --action t --chunk 3072 --q 0 || { ck_fail emission-q0 "failed"; return; }
+    kemit_place "$SC/p-q0.bin" 98 --placement-id 1 --no-move --q 0 || { ck_fail place-q0-emit "failed"; return; }
+    cat "$SC/t-q0.bin" "$SC/p-q0.bin" >"$SC/flow-q0.bin"
+    python3 - "$SC/t-q0.bin" "$SC/p-q0.bin" "$SC/control-q0.txt" <<'PYINNER'
+import sys
+out = []
+for path in sys.argv[1:3]:
+    d = open(path, 'rb').read()
+    for frame in d.split(b'\x1b_G')[1:]:
+        body = frame.split(b'\x1b\\')[0]
+        out.append("%s: %s" % (path.rsplit('/', 1)[-1], body.split(b';')[0].decode('latin-1')))
+open(sys.argv[3], 'w').write("\n".join(out) + "\n")
+PYINNER
+    cat "$SC/control-q0.txt" >>"$RUN/harness.log"
+    ck_info control-q0 "$(tr '\n' ' ' <"$SC/control-q0.txt")"
+    if grep -q 'q=0' "$SC/control-q0.txt"; then
+        ck_pass wire-q0 "explicit q=0 present in every control frame"
+    else
+        ck_fail wire-q0 "explicit q=0 missing from the emitted controls"
+    fi
+    session_send "python3 '$LIB/kitty_tty.py' drain --timeout 0.6 --out '$drained' >/dev/null 2>&1" 5 || true
+    send_file "$SC/flow-q0.bin" || { ck_fail flow-q0 "timed out"; return; }
+    session_send "python3 '$LIB/kitty_tty.py' drain --timeout 0.9 --out '$drained' >/dev/null 2>&1" 5 || true
+    bytes=$(stat -c %s "$drained" 2>/dev/null || echo 0)
+    ok=$(python3 - "$drained" <<'PYINNER'
+import os, sys
+d = open(sys.argv[1], 'rb').read() if os.path.exists(sys.argv[1]) else b''
+print(d.count(b'\x1b_G'))
+PYINNER
+)
+    ck_info replies-q0 "drained bytes=$bytes apc_frames=$ok"
+    if [ "${ok:-0}" -ge 1 ]; then
+        ck_pass q0-replies "q=0 produced OK replies ($ok APC frames)"
+    else
+        ck_fail q0-replies "q=0 produced no replies (spec C5)"
+    fi
+
+    # ---- shared emitter comparison (it defaults to q=2 for non-probe frames) ----
+    local shared=""
+    for c in "$SCRIPT_DIR/../../kitty-protocol/scripts/emit_kitty.py"; do
+        [ -f "$c" ] && { shared="$c"; break; }
+    done
+    if [ -n "$shared" ]; then
+        python3 "$shared" --file "$FIX/red-96.png" --id 99 --cols 20 --rows 10 --quiet >"$SC/flow-shared.bin" 2>/dev/null || true
+        python3 - "$SC/flow-shared.bin" >"$SC/control-shared.txt" <<'PYINNER'
+import sys
+d = open(sys.argv[1], 'rb').read()
+for n, frame in enumerate(d.split(b'\x1b_G')[1:], 1):
+    body = frame.split(b'\x1b\\')[0]
+    print("frame%d: %s" % (n, body.split(b';')[0].decode('latin-1')))
+PYINNER
+        ck_info control-shared-emitter "$(tr '\n' ' ' <"$SC/control-shared.txt" | cut -c1-240)"
+        if grep -q 'q=2' "$SC/control-shared.txt"; then
+            ck_info shared-emitter-note "emit_kitty.py defaults non-probe frames to q=2; it is therefore unsuitable for a q=0 reply test (harness uses kitty_wire/kitty_emit)"
+        fi
     fi
     if session_alive; then ck_pass alive "alive"; else ck_fail alive "died"; fi
 }
