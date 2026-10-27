@@ -7,7 +7,7 @@ asserting the resulting pixels and PTY replies.
 It reuses the imgcat harness session layer (private Xvfb + openbox, ptyxis under
 `dbus-run-session` with a `systemd-run` shim, FIFO command driver, screenshots,
 `scripts/lib/pixels.py` assertions) and adds Kitty-specific fixtures, a wire
-adapter, a capability probe, and 29 scenarios.
+adapter, a capability probe, and 32 scenarios.
 
 ## Usage
 
