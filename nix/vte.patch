@@ -1,9 +1,349 @@
+diff --git a/src/drawing-context.hh b/src/drawing-context.hh
+index 771b1de..dac2ab0 100644
+--- a/src/drawing-context.hh
++++ b/src/drawing-context.hh
+@@ -226,6 +226,20 @@ public:
+                                                   int height,
+                                                   vte::color::rgb const* color) const = 0;
+ 
++        /* Draw an image at the given rectangle.  This is optional: backends
++         * that do not support images simply keep the default no-op, which is
++         * what the GTK3 backend does. */
++        virtual void draw_image(
++#if VTE_GTK == 3
++                               cairo_surface_t *surface,
++#elif VTE_GTK == 4
++                               GdkTexture *texture,
++#endif
++                               int x,
++                               int y,
++                               int width,
++                               int height) const { }
++
+         void draw_undercurl(int x,
+                             double y,
+                             double line_width,
+diff --git a/src/drawing-gsk.cc b/src/drawing-gsk.cc
+index 577bb0a..410d7b7 100644
+--- a/src/drawing-gsk.cc
++++ b/src/drawing-gsk.cc
+@@ -282,6 +282,24 @@ DrawingGsk::draw_surface_with_color_mask(GdkTexture *texture,
+         gtk_snapshot_pop(m_snapshot);
+ }
+ 
++void
++DrawingGsk::draw_image(GdkTexture *texture,
++                       int x,
++                       int y,
++                       int width,
++                       int height) const
++{
++        g_assert(m_snapshot);
++        if (texture == nullptr || width <= 0 || height <= 0)
++                return;
++
++        const auto bounds = vte::graphene::make_rect(x, y, width, height);
++        gtk_snapshot_append_scaled_texture(m_snapshot,
++                                           texture,
++                                           GSK_SCALING_FILTER_TRILINEAR,
++                                           &bounds);
++}
++
+ void
+ DrawingGsk::begin_background(Rectangle const& rect,
+                              size_t columns,
+diff --git a/src/drawing-gsk.hh b/src/drawing-gsk.hh
+index bfd58ad..cbeefdf 100644
+--- a/src/drawing-gsk.hh
++++ b/src/drawing-gsk.hh
+@@ -120,6 +120,12 @@ public:
+                                           int height,
+                                           vte::color::rgb const* color) const override;
+ 
++        void draw_image(GdkTexture *texture,
++                        int x,
++                        int y,
++                        int width,
++                        int height) const override;
++
+         void draw_text(TextRequest* requests,
+                        gsize n_requests,
+                        uint32_t attr,
+diff --git a/src/parser-string.hh b/src/parser-string.hh
+index e84a5ef..f429fcc 100644
+--- a/src/parser-string.hh
++++ b/src/parser-string.hh
+@@ -35,7 +35,17 @@ typedef struct vte_seq_string_t {
+ 
+ #define VTE_SEQ_STRING_DEFAULT_CAPACITY (1 << 7) /* must be power of two */
+ 
+-#define VTE_SEQ_STRING_MAX_CAPACITY     (1 << 12)
++/* The upstream limit of 4096 code points is far too small for the OSC 1337
++ * iTerm2 inline image protocol, whose payload is a base64-encoded image and
++ * routinely runs into the megabytes.  Raise it so that reasonably sized
++ * images get through; Terminal::iterm2_1337() additionally enforces a
++ * stricter limit and a memory budget on the decoded data. */
++#define VTE_SEQ_STRING_MAX_CAPACITY     (1 << 24) /* 16 Mi code points */
++
++/* Above this capacity the buffer is released when the string is reset, so
++ * that a single large (e.g. inline image) payload does not pin tens of
++ * megabytes for the lifetime of the terminal. */
++#define VTE_SEQ_STRING_RETAINED_CAPACITY (1 << 14) /* 16 Ki code points */
+ 
+ /*
+  * vte_seq_string_init:
+@@ -119,7 +129,15 @@ static inline void vte_seq_string_finish(vte_seq_string_t* str)
+  */
+ static inline void vte_seq_string_reset(vte_seq_string_t* str) noexcept
+ {
+-        /* Zero length. However, don't clear the buffer, nor shrink the capacity. */
++        /* Zero length. However, don't clear the buffer, nor shrink the capacity,
++         * unless the buffer grew unusually large (as it does for inline images),
++         * in which case release the memory back. */
++        if (str->capacity > VTE_SEQ_STRING_RETAINED_CAPACITY) {
++                g_free(str->buf);
++                str->capacity = VTE_SEQ_STRING_DEFAULT_CAPACITY;
++                str->buf = (uint32_t*)g_malloc0_n(str->capacity, sizeof(uint32_t));
++        }
++
+         str->len = 0;
+ }
+ 
+diff --git a/src/vte.cc b/src/vte.cc
+index 4f6b437..5f47d1d 100644
+--- a/src/vte.cc
++++ b/src/vte.cc
+@@ -953,6 +953,14 @@ Terminal::emit_paste_clipboard()
+ 	g_signal_emit(m_terminal, signals[SIGNAL_PASTE_CLIPBOARD], 0);
+ }
+ 
++void
++Terminal::set_clipboard_text(vte::platform::ClipboardType type,
++                             std::string_view const& text) noexcept
++{
++        if (auto *w = widget())
++                w->clipboard_set_text (type, text.data(), text.size());
++}
++
+ /* Emit a "hyperlink_hover_uri_changed" signal. */
+ void
+ Terminal::emit_hyperlink_hover_uri_changed(const GdkRectangle *bbox)
+@@ -2861,10 +2869,13 @@ Terminal::scroll_text_up(scrolling_region const& scrolling_region,
+                 /* Scroll up by removing a line at the top and inserting a new one at the bottom. */
+                 // FIXME The runtime is quadratical to the number of lines scrolled,
+                 // modify ring_remove() and ring_insert() to take an "amount" parameter.
++                auto const shift = -long(amount);
+                 while (amount--) {
+                         ring_remove(top);
+                         ring_insert(bottom, fill);
+                 }
++                /* Move the anchors of inline images that scroll with the region. */
++                images_scroll_rows(top, bottom, shift);
+                 /* Repaint the affected lines. No need to extend, set_hard_wrapped() took care of
+                  * invalidating the context lines if necessary. */
+                 invalidate_rows(top, bottom);
+@@ -2936,10 +2947,13 @@ Terminal::scroll_text_down(scrolling_region const& scrolling_region,
+                 /* Scroll down by removing a line at the bottom and inserting a new one at the top. */
+                 // FIXME The runtime is quadratical to the number of lines scrolled,
+                 // modify ring_remove() and ring_insert() to take an "amount" parameter.
++                auto const shift = long(amount);
+                 while (amount--) {
+                         ring_remove(bottom);
+                         ring_insert(top, fill);
+                 }
++                /* Move the anchors of inline images that scroll with the region. */
++                images_scroll_rows(top, bottom, shift);
+                 /* Set the boundaries to hard wrapped where we tore apart or glued together the contents.
+                  * Do it after scrolling down, for the bottom row to be the desired one. */
+                 set_hard_wrapped(top - 1);
+@@ -3215,6 +3229,15 @@ Terminal::drop_scrollback()
+         /* Only for normal screen; alternate screen doesn't have a scrollback. */
+         m_normal_screen.row_data->drop_scrollback(m_normal_screen.insert_delta);
+ 
++        /* Drop the inline images that lived in the discarded scrollback. */
++        auto const first_row = long(m_normal_screen.insert_delta);
++        auto const end = std::remove_if (m_normal_screen.images.begin (),
++                                         m_normal_screen.images.end (),
++                                         [this, first_row](auto const& image) {
++                                                 return image->top + image_cell_rows (*image) - 1 < first_row;
++                                         });
++        m_normal_screen.images.erase (end, m_normal_screen.images.end ());
++
+         if (m_screen == &m_normal_screen) {
+                 queue_adjustment_value_changed(m_normal_screen.insert_delta);
+                 adjust_adjustments_full();
+@@ -10035,6 +10058,108 @@ Terminal::widget_snapshot(GtkSnapshot* snapshot_object) noexcept
+ 
+ #endif /* VTE_GTK == 4 */
+ 
++/* Number of grid rows an inline image currently spans.  Recomputed from the
++ * pixel height because the cell metrics can change (e.g. font size), and the
++ * image itself is stored in pixels. */
++int
++Terminal::image_cell_rows(VteImage const& image) const noexcept
++{
++        auto const h = int(m_cell_height);
++        return h > 0 ? std::max (1, (image.height + h - 1) / h) : 1;
++}
++
++int
++Terminal::image_cell_columns(VteImage const& image) const noexcept
++{
++        auto const w = int(m_cell_width);
++        return w > 0 ? std::max (1, (image.width + w - 1) / w) : 1;
++}
++
++/* Drop all inline images of a screen. */
++void
++Terminal::images_clear_screen(VteScreen *screen_) noexcept
++{
++        if (screen_ == nullptr || screen_->images.empty ())
++                return;
++
++        screen_->images.clear ();
++        if (screen_ == m_screen)
++                invalidate_all ();
++}
++
++/* Drop images that can never be visible again: those that have scrolled out
++ * of the ring (their bottom edge is above the first row still retained), and
++ * those whose anchor row was discarded by a rewrap that made the buffer
++ * shorter.  Rings grow on demand, so anchors at or past the current end are
++ * only orphans when the ring has content below them already; the empty or
++ * freshly-initialised case is excluded by requiring end > first. */
++void
++Terminal::images_cull(VteScreen *screen_) noexcept
++{
++        if (screen_ == nullptr || screen_->images.empty ())
++                return;
++
++        auto const first_row = long(screen_->row_data->delta ());
++        auto const end_row = long(screen_->row_data->next ());
++        auto const end = std::remove_if (screen_->images.begin (),
++                                         screen_->images.end (),
++                                         [this, first_row, end_row](auto const& image) {
++                                                 return image->top + image_cell_rows (*image) - 1 < first_row ||
++                                                        (end_row > first_row && image->top >= end_row);
++                                         });
++        if (end != screen_->images.end ())
++                screen_->images.erase (end, screen_->images.end ());
++}
++
++/* Enforce the per-screen memory budget by evicting the oldest images. */
++void
++Terminal::images_trim_memory(VteScreen *screen_) noexcept
++{
++        if (screen_ == nullptr || screen_->images.empty ())
++                return;
++
++        auto total = gsize{0};
++        for (auto const& image : screen_->images)
++                total += image->bytes;
++
++        auto first = screen_->images.begin ();
++        while (total > kMaxImagesBytes && first != screen_->images.end ()) {
++                total -= (*first)->bytes;
++                ++first;
++        }
++
++        if (first != screen_->images.begin ())
++                screen_->images.erase (screen_->images.begin (), first);
++}
++
++/* Shift the anchors of inline images living inside a scrolling region, when
++ * that region scrolls by moving the cell data in place (i.e. when it does not
++ * push rows into the scrollback).  Images pushed out of the region are
++ * dropped. */
++void
++Terminal::images_scroll_rows(long first_row, long last_row, long delta) noexcept
++{
++        if (delta == 0 || m_screen->images.empty ())
++                return;
++
++        auto const end = std::remove_if (m_screen->images.begin (),
++                                         m_screen->images.end (),
++                                         [this, first_row, last_row, delta](auto const& image) {
++                                                 if (image->top < first_row || image->top > last_row)
++                                                         return false;
++
++                                                 auto const new_top = image->top + delta;
++                                                 auto const rows = image_cell_rows (*image);
++                                                 if (new_top < first_row ||
++                                                     new_top + rows - 1 > last_row)
++                                                         return true;
++
++                                                 image->top = new_top;
++                                                 return false;
++                                         });
++        m_screen->images.erase (end, m_screen->images.end ());
++}
++
+ void
+ Terminal::draw(cairo_region_t const* region) noexcept
+ {
+@@ -10104,6 +10229,42 @@ Terminal::draw(cairo_region_t const* region) noexcept
+                   m_cell_width,
+                   m_cell_height);
+ 
++        /* Draw inline images (iTerm2 OSC 1337) on top of the text.  These live
++         * in the screen's image list, anchored to absolute grid rows, so they
++         * scroll with the content and are clipped to the text area here. */
++        if (!m_screen->images.empty()) {
++                images_cull (m_screen);
++
++                auto const area_height = allocated_height - m_border.top - m_border.bottom;
++                auto const area = vte::view::Rectangle{
++                        0, 0,
++                        int(m_column_count * m_cell_width),
++                        area_height};
++                m_draw.clip_border (&area);
++
++                auto const last_row = last_displayed_row ();
++                for (auto const& image : m_screen->images) {
++                        auto const rows = image_cell_rows (*image);
++                        if (image->top + rows - 1 < first_row ||
++                            image->top > last_row)
++                                continue;
++
++                        auto const y = row_to_pixel (image->top);
++                        if (y >= area_height || y + image->height <= 0)
++                                continue;
++
++#if VTE_GTK == 4
++                        m_draw.draw_image (image->texture,
++                                           int(image->left * m_cell_width) + image->off_x,
++                                           int(y) + image->off_y,
++                                           image->draw_width,
++                                           image->draw_height);
++#endif
++                }
++
++                m_draw.unclip_border ();
++        }
++
+ 	paint_im_preedit_string();
+ 
+         m_draw.unclip_border();
+@@ -10762,6 +10923,10 @@ Terminal::reset(bool clear_tabstops,
+ 	/* Clear the scrollback buffers and reset the cursors. Switch to normal screen. */
+ 	if (clear_history) {
+                 m_screen = &m_normal_screen;
++                /* The rings (and with them the absolute row numbering) are
++                 * reset, so any inline images anchored to old rows are gone. */
++                m_normal_screen.images.clear();
++                m_alternate_screen.images.clear();
+                 m_normal_screen.scroll_delta = m_normal_screen.insert_delta =
+                         m_normal_screen.row_data->reset();
+                 m_normal_screen.cursor.row = m_normal_screen.insert_delta;
+diff --git a/src/vteinternal.hh b/src/vteinternal.hh
+index 4ba6357..fca4d43 100644
 --- a/src/vteinternal.hh
 +++ b/src/vteinternal.hh
-@@ -28,6 +28,10 @@
+@@ -28,6 +28,11 @@
  #endif
  
  #include <climits>
++#include <charconv>
 +#include <memory>
 +#include <string_view>
 +#include <vector>
@@ -11,21 +351,40 @@
  static_assert(CHAR_BIT == 8, "Weird");
  
  /* END sanity checks */
-@@ -139,6 +143,21 @@
+@@ -139,6 +144,40 @@ typedef struct _VtePaletteColor {
  	} sources[2];
  } VtePaletteColor;
  
-+/* An inline image (iTerm2 OSC 1337 File=) anchored to a grid position. */
++/* An inline image (iTerm2 OSC 1337 File=) anchored to an absolute grid
++ * position.  The size is stored in CSS pixels, i.e. the coordinate space in
++ * which VTE draws, and is derived from the image's device pixels by dividing
++ * by the widget scale factor.  Anchoring it to a row instead of the cell data
++ * makes it scroll with the grid without affecting selection or rewrap.
++ * Images are only supported in the GTK4 build; on GTK3 the type exists but no
++ * texture is ever attached. */
 +struct VteImage {
++#if VTE_GTK == 4
 +        GdkTexture *texture{nullptr};
++#endif
 +        long top{0};          /* absolute grid row of the top edge */
 +        long left{0};         /* grid column of the left edge */
-+        int width{0};         /* painted width, in pixels */
-+        int height{0};        /* painted height, in pixels */
-+        int rows{1};          /* number of grid rows spanned, for culling */
++        int width{0};         /* reserved box width, in CSS pixels */
++        int height{0};        /* reserved box height, in CSS pixels */
++        int draw_width{0};    /* bitmap width, in CSS pixels */
++        int draw_height{0};   /* bitmap height, in CSS pixels */
++        int off_x{0};         /* bitmap offset inside the box */
++        int off_y{0};
++        int rows{1};          /* number of grid rows spanned when inserted */
++        int columns{1};       /* number of grid columns spanned when inserted */
++        gsize bytes{0};       /* approximate texture memory, for accounting */
 +
 +        VteImage() = default;
-+        ~VteImage() { g_clear_object (&texture); }
++        ~VteImage()
++        {
++#if VTE_GTK == 4
++                g_clear_object (&texture);
++#endif
++        }
 +        VteImage (VteImage const&) = delete;
 +        VteImage& operator= (VteImage const&) = delete;
 +};
@@ -33,16 +392,18 @@
  struct VteScreen {
  public:
          VteScreen(gulong max_rows,
-@@ -159,6 +178,8 @@
+@@ -159,6 +198,10 @@ public:
          double scroll_delta{0.0}; /* scroll offset */
          long insert_delta{0}; /* insertion offset */
  
-+        std::vector<std::unique_ptr<VteImage>> images{}; /* inline images on this screen */
++        /* Inline images anchored to absolute rows on this screen.  Kept out of
++         * the cell data so that they neither affect text selection nor rewrap. */
++        std::vector<std::unique_ptr<VteImage>> images{};
 +
          /* Stuff saved along with the cursor */
          struct {
                  VteVisualPosition cursor;  /* onscreen coordinate, that is, relative to insert_delta */
-@@ -1429,6 +1450,8 @@
+@@ -1429,6 +1472,8 @@ public:
                                  guint rows);
          void emit_copy_clipboard();
          void emit_paste_clipboard();
@@ -51,7 +412,7 @@
          void emit_hyperlink_hover_uri_changed(const GdkRectangle *bbox);
  
          void hyperlink_invalidate_and_get_bbox(vte::base::Ring::hyperlink_idx_t idx, GdkRectangle *bbox);
-@@ -1789,6 +1812,11 @@
+@@ -1789,6 +1834,29 @@ public:
          void vte_termprop(vte::parser::Sequence const& seq,
                            vte::parser::StringTokeniser::const_iterator& token,
                            vte::parser::StringTokeniser::const_iterator const& endtoken) noexcept;
@@ -60,15 +421,55 @@
 +                                  vte::parser::StringTokeniser::const_iterator const& endtoken) noexcept;
 +        void iterm2_1337(vte::parser::Sequence const& seq,
 +                         std::string_view const& body) noexcept;
++
++        /* Inline image bookkeeping. */
++        void images_clear_screen(VteScreen *screen_) noexcept;
++        void images_cull(VteScreen *screen_) noexcept;
++        void images_trim_memory(VteScreen *screen_) noexcept;
++        void images_scroll_rows(long first_row, long last_row, long delta) noexcept;
++        int image_cell_rows(VteImage const& image) const noexcept;
++        int image_cell_columns(VteImage const& image) const noexcept;
++
++        /* Limits, see docs/iterm2-inline-images.md §1.3. */
++        static constexpr gsize kMaxImageEncodedBytes = 32 * 1024 * 1024;
++        static constexpr guint64 kMaxImagePixels = 25'000'000;
++        static constexpr gsize kMaxImageBytes = 64 * 1024 * 1024;    /* per image, decoded */
++        static constexpr gsize kMaxImagesBytes = 192 * 1024 * 1024;  /* total per screen */
++
++        /* The OSC payload itself is capped by VTE_SEQ_STRING_MAX_CAPACITY
++         * (parser-string.hh), which this patch raises to 16 Mi code points,
++         * i.e. about 12 MiB of decoded data. */
  
          void urxvt_extension(vte::parser::Sequence const& seq,
                               vte::parser::StringTokeniser::const_iterator& token,
+diff --git a/src/vteseq.cc b/src/vteseq.cc
+index 36ef93a..2f51ba9 100644
 --- a/src/vteseq.cc
 +++ b/src/vteseq.cc
-@@ -2002,6 +2002,156 @@
+@@ -165,6 +165,8 @@ Terminal::clear_screen()
+         m_screen->insert_delta = initial;
+         m_screen->cursor.row = row + m_screen->insert_delta;
+         m_screen->cursor_advanced_by_graphic_character = false;
++        /* The screen was cleared; drop the inline images painted on it. */
++        images_clear_screen (m_screen);
+         adjust_adjustments();
+ 	/* Redraw everything. */
+         invalidate_all();
+@@ -245,6 +247,9 @@ Terminal::save_cursor()
+ void
+ Terminal::switch_normal_screen()
+ {
++        /* The alternate screen is left; drop the images painted on it, so that
++         * a later visit starts from a clean slate. */
++        images_clear_screen (&m_alternate_screen);
+         switch_screen(&m_normal_screen);
  }
  
- void
+@@ -2001,6 +2006,365 @@ catch (...)
+         // nothing to do here
+ }
+ 
++void
 +Terminal::xterm_set_xselection(vte::parser::Sequence const& seq,
 +                               vte::parser::StringTokeniser::const_iterator& token,
 +                               vte::parser::StringTokeniser::const_iterator const& endtoken) noexcept
@@ -124,105 +525,313 @@
 +                      std::string_view const& body) noexcept
 +try
 +{
++#if VTE_GTK != 4
++        /* Inline images are implemented for the GTK4/GSK backend only; the
++         * GTK3 backend keeps its no-op draw_image and simply ignores them. */
++        (void)seq;
++        (void)body;
++#else
 +        // iTerm2 inline image: OSC 1337 ; File=[params]:base64 ST
++        //
++        // See https://iterm2.com/documentation-images.html and WezTerm's
++        // term/src/terminalstate/iterm.rs + wezterm-escape-parser/src/osc.rs
++        // for the reference behaviour implemented here.
 +        if (body.substr (0, 5) != "File="sv)
 +                return;
 +
++        // The parameter list is separated from the base64 payload by the first
++        // ':'; base64 itself never contains one, so this is unambiguous.
 +        auto const colon = body.find (':', 5);
 +        if (colon == std::string_view::npos)
 +                return;
 +
 +        auto const params = body.substr (5, colon - 5);
 +        auto const encoded = body.substr (colon + 1);
++        if (encoded.empty () || encoded.size () > kMaxImageEncodedBytes)
++                return;
++
++        enum class Unit { Automatic, Cells, Pixels, Percent };
++        struct Dimension {
++                Unit unit{Unit::Automatic};
++                long value{0};
++        };
++
++        auto parse_dimension = [](std::string_view const& s) -> Dimension {
++                auto d = Dimension{};
++
++                auto number = s;
++                if (s == "auto"sv) {
++                        return d;
++                } else if (s.size () >= 2 && s.substr (s.size () - 2) == "px"sv) {
++                        d.unit = Unit::Pixels;
++                        number = s.substr (0, s.size () - 2);
++                } else if (s.size () >= 1 && s.back () == '%') {
++                        d.unit = Unit::Percent;
++                        number = s.substr (0, s.size () - 1);
++                } else {
++                        d.unit = Unit::Cells;
++                }
++
++                auto value = 0L;
++                auto const [ptr, ec] = std::from_chars (number.data (),
++                                                        number.data () + number.size (),
++                                                        value);
++                if (ec != std::errc () || ptr != number.data () + number.size ())
++                        return Dimension{};
++
++                d.value = value;
++                return d;
++        };
 +
 +        auto inline_image = false;
 +        auto do_not_move_cursor = false;
++        auto preserve_aspect_ratio = true;
++        auto width_dim = Dimension{};
++        auto height_dim = Dimension{};
 +
-+        for (size_t pos = 0; pos <= params.size (); )
-+                {
-+                        auto const semi = params.find (';', pos);
-+                        auto const token = params.substr (pos, semi == std::string_view::npos ? std::string_view::npos : semi - pos);
-+                        pos = (semi == std::string_view::npos) ? params.size () + 1 : semi + 1;
++        for (auto pos = size_t{0}; pos <= params.size (); ) {
++                auto const semi = params.find (';', pos);
++                auto const token = params.substr (pos, semi == std::string_view::npos ? std::string_view::npos : semi - pos);
++                pos = (semi == std::string_view::npos) ? params.size () + 1 : semi + 1;
 +
-+                        if (token.empty ())
-+                                continue;
++                auto const eq = token.find ('=');
++                if (eq == std::string_view::npos)
++                        continue;
 +
-+                        auto const eq = token.find ('=');
-+                        if (eq == std::string_view::npos)
-+                                continue;
++                auto const key = token.substr (0, eq);
++                auto const value = token.substr (eq + 1);
 +
-+                        auto const key = token.substr (0, eq);
-+                        auto const value = token.substr (eq + 1);
++                // As in WezTerm, the booleans are "true unless explicitly 0",
++                // so that both "inline" and "inline=1" enable the feature.
++                if (key == "inline"sv)
++                        inline_image = (value != "0"sv);
++                else if (key == "doNotMoveCursor"sv)
++                        do_not_move_cursor = (value != "0"sv);
++                else if (key == "preserveAspectRatio"sv)
++                        preserve_aspect_ratio = (value != "0"sv);
++                else if (key == "width"sv)
++                        width_dim = parse_dimension (value);
++                else if (key == "height"sv)
++                        height_dim = parse_dimension (value);
++                // "name" and "size" are only meaningful for file downloads,
++                // which we do not support; parsing them is a no-op.
++        }
 +
-+                        if (key == "inline"sv)
-+                                inline_image = (value == "1"sv);
-+                        else if (key == "doNotMoveCursor"sv)
-+                                do_not_move_cursor = (value == "1"sv);
-+                }
-+
++        // Non-inline requests are file downloads.  We do not implement a
++        // download handler, so ignore them, like WezTerm does without one.
 +        if (!inline_image)
 +                return;
 +
-+        if (m_cell_width <= 0 || m_cell_height <= 0)
++        auto const cell_width = int(m_cell_width);
++        auto const cell_height = int(m_cell_height);
++        if (cell_width <= 0 || cell_height <= 0)
 +                return;
 +
-+        auto const encoded_str = std::string{encoded};
-+        gsize decoded_len = 0;
++        // Tolerate whitespace and missing padding in the base64 payload, as
++        // iTerm2 does (spec C8).
++        auto encoded_str = std::string{encoded};
++        while (!encoded_str.empty () &&
++               std::isspace (static_cast<unsigned char> (encoded_str.back ())))
++                encoded_str.pop_back ();
++        switch (encoded_str.size () % 4) {
++        case 1:
++                return; /* not a valid base64 length */
++        case 2:
++                encoded_str += "==";
++                break;
++        case 3:
++                encoded_str += '=';
++                break;
++        default:
++                break;
++        }
++
++        auto decoded_len = gsize{0};
 +        g_autofree guchar *decoded = g_base64_decode (encoded_str.c_str (), &decoded_len);
 +        if (decoded == nullptr || decoded_len == 0)
 +                return;
 +
 +        g_autoptr(GBytes) bytes = g_bytes_new (decoded, decoded_len);
 +        g_autoptr(GError) error = nullptr;
-+        auto *texture = gdk_texture_new_from_bytes (bytes, &error);
++        g_autoptr(GdkTexture) texture = gdk_texture_new_from_bytes (bytes, &error);
 +        if (texture == nullptr)
 +                return;
 +
-+        auto const native_width = gdk_texture_get_width (texture);
-+        auto const native_height = gdk_texture_get_height (texture);
++        auto const native_width = int(gdk_texture_get_width (texture));
++        auto const native_height = int(gdk_texture_get_height (texture));
++        if (native_width <= 0 || native_height <= 0)
++                return;
++        auto const decoded_bytes = gsize(native_width) * gsize(native_height) * 4u;
++        if (guint64(native_width) * guint64(native_height) > kMaxImagePixels ||
++            decoded_bytes == 0 || decoded_bytes > kMaxImageBytes)
++                return;
 +
-+        // Fit to the viewport, preserving the aspect ratio.
-+        auto const max_width = int (m_column_count) * int (m_cell_width);
-+        auto const max_height = int (m_row_count) * int (m_cell_height);
-+        auto scale = 1.0;
-+        if (native_width > max_width)
-+                scale = double (max_width) / native_width;
-+        if (native_height > max_height)
-+                scale = std::min (scale, double (max_height) / native_height);
-+        if (scale > 1.0)
-+                scale = 1.0;
++        auto const column_count = int(m_column_count);
++        auto const row_count = int(m_row_count);
++        auto const viewport_width = column_count * cell_width;
++        auto const viewport_height = row_count * cell_height;
 +
-+        auto const width = std::max (1, int (native_width * scale));
-+        auto const height = std::max (1, int (native_height * scale));
-+        auto const columns = (width + int (m_cell_width) - 1) / int (m_cell_width);
++        // VTE draws in CSS pixels, while images and the "px" unit are in device
++        // pixels (as they are in iTerm2 and WezTerm).  Convert once, so that an
++        // image pixel maps to exactly one device pixel.
++        auto const scale = double(std::max (1, m_draw.scale_factor()));
++
++        auto const round_half_up = [](double v) -> int {
++                return int(std::floor (v + 0.5));
++        };
++
++        auto const clamp_mul = [](long a, long b) -> int {
++                if (a <= 0 || b <= 0)
++                        return 0;
++                if (a > long(INT_MAX) / b)
++                        return INT_MAX;
++                return int(a * b);
++        };
++
++        auto to_pixels = [&](Dimension const& d, int cell_size, int cells) -> std::optional<int> {
++                switch (d.unit) {
++                case Unit::Automatic:
++                        return std::nullopt;
++                case Unit::Cells:
++                        return clamp_mul (d.value, cell_size);
++                case Unit::Pixels:
++                        // "px" is device pixels; VTE draws in CSS pixels.
++                        return d.value <= 0 ? 0 : int(std::lround (double(std::min<long> (d.value, INT_MAX)) / scale));
++                case Unit::Percent:
++                        return round_half_up (double(std::clamp<long> (d.value, 0, 100)) / 100.0 *
++                                              double(cells) * double(cell_size));
++                }
++                return std::nullopt;
++        };
++
++        auto const width_px = to_pixels (width_dim, cell_width, column_count);
++        auto const height_px = to_pixels (height_dim, cell_height, row_count);
++
++        // A requested dimension that resolves to zero drops the image.
++        if ((width_px.has_value () && *width_px <= 0) ||
++            (height_px.has_value () && *height_px <= 0))
++                return;
++
++        auto const native_css_w = std::max (1, round_half_up (double(native_width) / scale));
++        auto const native_css_h = std::max (1, round_half_up (double(native_height) / scale));
++        auto const aspect = double(native_width) / double(native_height);
++
++        // Resolve the requested dimensions per docs/iterm2-inline-images.md §3.2.
++        // "box" is the cell region reserved on the grid, "draw" the bitmap
++        // painted inside it (letterboxed and centred when the aspect ratios
++        // differ).
++        auto box_w = 0, box_h = 0;
++        auto draw_w = 0, draw_h = 0;
++        auto off_x = 0, off_y = 0;
++
++        if (!width_px.has_value () && !height_px.has_value ()) {
++                // Native size, clamped to the viewport preserving aspect.
++                box_w = draw_w = native_css_w;
++                box_h = draw_h = native_css_h;
++                if (viewport_width > 0 && viewport_height > 0 &&
++                    (box_w > viewport_width || box_h > viewport_height)) {
++                        auto const s = std::min (double(viewport_width) / box_w,
++                                                 double(viewport_height) / box_h);
++                        box_w = draw_w = std::max (1, int(std::floor (box_w * s)));
++                        box_h = draw_h = std::max (1, int(std::floor (box_h * s)));
++                }
++        } else if (width_px.has_value () && !height_px.has_value ()) {
++                box_w = draw_w = std::max (1, *width_px);
++                box_h = draw_h = std::max (1, round_half_up (double(box_w) / aspect));
++        } else if (!width_px.has_value () && height_px.has_value ()) {
++                box_h = draw_h = std::max (1, *height_px);
++                box_w = draw_w = std::max (1, round_half_up (double(box_h) * aspect));
++        } else if (preserve_aspect_ratio) {
++                // Reserve the requested box and fit the bitmap inside it.
++                box_w = *width_px;
++                box_h = *height_px;
++                auto const s = std::min (double(box_w) / native_css_w,
++                                         double(box_h) / native_css_h);
++                draw_w = std::max (1, round_half_up (double(native_css_w) * s));
++                draw_h = std::max (1, round_half_up (double(native_css_h) * s));
++                off_x = (box_w - draw_w) / 2;
++                off_y = (box_h - draw_h) / 2;
++        } else {
++                box_w = draw_w = *width_px;
++                box_h = draw_h = *height_px;
++        }
++
++        // Width safety clamp: never paint outside the grid (spec C24).
++        if (viewport_width > 0 && box_w > viewport_width) {
++                auto const s = double(viewport_width) / box_w;
++                box_w = viewport_width;
++                draw_w = std::max (1, int(std::floor (draw_w * s)));
++                box_h = std::max (1, int(std::floor (box_h * s)));
++                draw_h = std::max (1, int(std::floor (draw_h * s)));
++                off_x = (box_w - draw_w) / 2;
++                off_y = (box_h - draw_h) / 2;
++        }
++
++        // iTerm2's structural cap: at most 255 rows of image cells (spec C15).
++        if (auto const max_box_h = 255 * cell_height;
++            max_box_h > 0 && box_h > max_box_h) {
++                auto const s = double(max_box_h) / box_h;
++                box_h = max_box_h;
++                draw_h = std::max (1, int(std::floor (draw_h * s)));
++                box_w = std::max (1, int(std::floor (box_w * s)));
++                draw_w = std::max (1, int(std::floor (draw_w * s)));
++                off_x = (box_w - draw_w) / 2;
++                off_y = (box_h - draw_h) / 2;
++        }
++
++        if (box_w <= 0 || box_h <= 0 || draw_w <= 0 || draw_h <= 0)
++                return;
++
++        // Guard against absurd pixel dimensions, which would make GSK
++        // allocate enormous buffers.
++        static constexpr auto kMaxDimension = 32768;
++        box_w = std::clamp (box_w, 1, kMaxDimension);
++        box_h = std::clamp (box_h, 1, kMaxDimension);
++        draw_w = std::clamp (draw_w, 1, box_w);
++        draw_h = std::clamp (draw_h, 1, box_h);
 +
 +        auto image = std::make_unique<VteImage>();
-+        image->texture = texture; // takes ownership of the reference
-+        image->left = m_screen->cursor.col;
 +        image->top = m_screen->cursor.row;
-+        image->width = width;
-+        image->height = height;
-+        image->rows = (height + int (m_cell_height) - 1) / int (m_cell_height);
++        image->left = m_screen->cursor.col;
++        image->width = box_w;
++        image->height = box_h;
++        image->draw_width = draw_w;
++        image->draw_height = draw_h;
++        image->off_x = off_x;
++        image->off_y = off_y;
++        image->rows = image_cell_rows (*image);
++        image->columns = image_cell_columns (*image);
++        image->bytes = decoded_bytes;
++        image->texture = g_steal_pointer (&texture);
 +
-+        if (!do_not_move_cursor)
-+                {
-+                        for (int i = 1; i < image->rows; i++)
-+                                cursor_down_with_scrolling (true);
-+                        move_cursor_forward (columns);
-+                }
++        auto const rows = image->rows;
++        auto const columns = image->columns;
 +
 +        m_screen->images.push_back (std::move (image));
++        images_trim_memory (m_screen);
++
++        // Cursor semantics (spec C18): the cursor ends on the image's last
++        // row, at the column just right of it, clamped to the last column.
++        // Rows that do not fit scroll the screen (spec C19).
++        if (!do_not_move_cursor) {
++                for (auto i = 1; i < rows; i++)
++                        cursor_down_with_scrolling (true);
++                m_screen->cursor.col = std::min<long> (m_screen->cursor.col + columns,
++                                                       m_column_count - 1);
++                m_screen->cursor_advanced_by_graphic_character = false;
++        }
++
 +        invalidate_all ();
++#endif /* VTE_GTK == 4 */
 +}
 +catch (...)
 +{
 +}
 +
-+void
+ void
  Terminal::urxvt_extension(vte::parser::Sequence const& seq,
                            vte::parser::StringTokeniser::const_iterator& token,
-                           vte::parser::StringTokeniser::const_iterator const& endtoken) noexcept
-@@ -7753,6 +7903,14 @@
+@@ -7753,6 +8117,14 @@ try
                  conemu_extension(seq, it, cend);
                  break;
  
@@ -237,7 +846,7 @@
          case VTE_OSC_XTERM_SET_ICON_TITLE:
          case VTE_OSC_XTERM_SET_XPROPERTY:
          case VTE_OSC_XTERM_SET_COLOR_MOUSE_CURSOR_FG:
-@@ -7763,7 +7921,6 @@
+@@ -7763,7 +8135,6 @@ try
          case VTE_OSC_XTERM_SET_CURSOR_NAME:
          case VTE_OSC_XTERM_LOGFILE:
          case VTE_OSC_XTERM_SET_FONT:
@@ -245,7 +854,7 @@
          case VTE_OSC_XTERM_SET_COLOR_MODE:
          case VTE_OSC_XTERM_RESET_COLOR_MOUSE_CURSOR_FG:
          case VTE_OSC_XTERM_RESET_COLOR_MOUSE_CURSOR_BG:
-@@ -7771,7 +7928,6 @@
+@@ -7771,7 +8142,6 @@ try
          case VTE_OSC_XTERM_RESET_COLOR_TEK_BG:
          case VTE_OSC_XTERM_RESET_COLOR_TEK_CURSOR:
          case VTE_OSC_EMACS_51:
@@ -253,115 +862,3 @@
          case VTE_OSC_KONSOLE_30:
          case VTE_OSC_KONSOLE_31:
          case VTE_OSC_RLOGIN_SET_KANJI_MODE:
---- a/src/vte.cc
-+++ b/src/vte.cc
-@@ -953,6 +953,14 @@
- 	g_signal_emit(m_terminal, signals[SIGNAL_PASTE_CLIPBOARD], 0);
- }
- 
-+void
-+Terminal::set_clipboard_text(vte::platform::ClipboardType type,
-+                             std::string_view const& text) noexcept
-+{
-+        if (auto *w = widget())
-+                w->clipboard_set_text (type, text.data(), text.size());
-+}
-+
- /* Emit a "hyperlink_hover_uri_changed" signal. */
- void
- Terminal::emit_hyperlink_hover_uri_changed(const GdkRectangle *bbox)
-@@ -10104,6 +10112,22 @@
-                   m_cell_width,
-                   m_cell_height);
- 
-+        /* Draw inline images (iTerm2 OSC 1337) on top of the text. */
-+        if (!m_screen->images.empty())
-+                {
-+                        auto const last_row = last_displayed_row();
-+                        for (auto const& image : m_screen->images)
-+                                {
-+                                        if (image->top + image->rows - 1 < first_row || image->top > last_row)
-+                                                continue;
-+                                        m_draw.draw_image(image->texture,
-+                                                          int(image->left * m_cell_width),
-+                                                          row_to_pixel(image->top),
-+                                                          image->width,
-+                                                          image->height);
-+                                }
-+                }
-+
- 	paint_im_preedit_string();
- 
-         m_draw.unclip_border();
-@@ -10742,6 +10766,10 @@
-                 m_tabstops.reset();
-         }
- 
-+        /* Drop any inline images. */
-+        m_normal_screen.images.clear();
-+        m_alternate_screen.images.clear();
-+
-         /* Window title stack */
-         if (clear_history) {
-                 m_window_title_stack.clear();
---- a/src/drawing-context.hh
-+++ b/src/drawing-context.hh
-@@ -226,6 +226,17 @@
-                                                   int height,
-                                                   vte::color::rgb const* color) const = 0;
- 
-+        virtual void draw_image(
-+#if VTE_GTK == 3
-+                               cairo_surface_t *surface,
-+#elif VTE_GTK == 4
-+                               GdkTexture *texture,
-+#endif
-+                               int x,
-+                               int y,
-+                               int width,
-+                               int height) const { }
-+
-         void draw_undercurl(int x,
-                             double y,
-                             double line_width,
---- a/src/drawing-gsk.hh
-+++ b/src/drawing-gsk.hh
-@@ -120,6 +120,12 @@
-                                           int height,
-                                           vte::color::rgb const* color) const override;
- 
-+        void draw_image(GdkTexture *texture,
-+                        int x,
-+                        int y,
-+                        int width,
-+                        int height) const override;
-+
-         void draw_text(TextRequest* requests,
-                        gsize n_requests,
-                        uint32_t attr,
---- a/src/drawing-gsk.cc
-+++ b/src/drawing-gsk.cc
-@@ -283,6 +283,23 @@
- }
- 
- void
-+DrawingGsk::draw_image(GdkTexture *texture,
-+                       int x,
-+                       int y,
-+                       int width,
-+                       int height) const
-+{
-+        if (texture == nullptr || width <= 0 || height <= 0)
-+                return;
-+
-+        const auto bounds = vte::graphene::make_rect(x, y, width, height);
-+        gtk_snapshot_append_scaled_texture(m_snapshot,
-+                                           texture,
-+                                           GSK_SCALING_FILTER_TRILINEAR,
-+                                           &bounds);
-+}
-+
-+void
- DrawingGsk::begin_background(Rectangle const& rect,
-                              size_t columns,
-                              size_t rows)
