@@ -347,13 +347,22 @@ security posture.
 
 ---
 
-## Inline Images (`imgcat`)
+## Inline Images (`imgcat` and Kitty graphics)
 
-This build patches VTE to implement the [iTerm2 inline image
-protocol](https://iterm2.com/documentation-images.html) (`OSC 1337 ; File=...`),
-so images render as real raster graphics — the same mechanism WezTerm uses —
-instead of falling back to Unicode/block glyphs. Any client that speaks the
-protocol works:
+This build patches VTE to render images as real raster graphics — the same
+mechanisms WezTerm uses — instead of falling back to Unicode/block glyphs. Two
+protocols are implemented:
+
+- **[iTerm2 inline images](https://iterm2.com/documentation-images.html)**
+  (`OSC 1337 ; File=...`), used by `imgcat`, `chafa --format=iterm`, and
+  similar tools.
+- **[Kitty graphics](https://sw.kovidgoyal.net/kitty/graphics-protocol/)**
+  (APC `ESC _ G ...`), used by kitty/ghostty clients, OpenTUI, and therefore
+  **OpenCode's image previews**.
+
+### iTerm2 `OSC 1337`
+
+Any client that speaks the protocol works:
 
 ```bash
 wezterm imgcat photo.png
@@ -376,6 +385,26 @@ transfers and non-inline file downloads are not implemented. See
 format, sizing rules and a conformance checklist, and
 [`scripts/imgcat-e2e.sh`](scripts/imgcat-e2e.sh) for the headless end-to-end
 tests.
+
+### Kitty graphics (OpenCode, kitty, ghostty)
+
+The same VTE patch answers the Kitty capability probe (`a=q` →
+`ESC _ G i=31337;OK ESC \`), so clients that gate on it stop falling back to
+Unicode blocks. **OpenCode's image previews work without any OpenCode-side
+change** (make sure `session.image_preview` / `prompt.image_preview` are
+enabled in your OpenCode config).
+
+Implemented: direct transmission (`a=t`, `a=T`, `a=f`) with PNG (`f=100`),
+RGB (`f=24`), RGBA (`f=32`) and zlib (`o=z`), chunked with `m=1`; placements
+(`a=p`) with cell boxes, source crops, `C=1` and signed `z` (negative draws
+behind glyphs); deletion (`d=i`, `d=I`, `d=a`, `d=A`); `q=0/1/2` reply
+semantics. Kitty images share the scroll, cull, clear and memory-limiting
+lifecycle described above.
+
+Not implemented: file-based transports (`t=f`/`t=t`), animation/`a=f` frames,
+Unicode placeholders, and `d=p`/cell-intersection selectors. See
+[`docs/kitty-graphics-protocol.md`](docs/kitty-graphics-protocol.md) and
+[`scripts/kitty-e2e.sh`](scripts/kitty-e2e.sh).
 
 ---
 
