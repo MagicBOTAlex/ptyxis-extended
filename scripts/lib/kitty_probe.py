@@ -189,7 +189,13 @@ def run_probe_fd(fd, timeout=1.5, probe_bytes=DEFAULT_PROBE,
         if raw_mode:
             try:
                 saved = termios.tcgetattr(fd)
-                tty.setraw(fd)
+                tty.setraw(fd, when=termios.TCSANOW)
+                # Explicitly discard any stale input *before* the probe (TCSANOW
+                # above deliberately does not flush a queued reply).
+                try:
+                    termios.tcflush(fd, termios.TCIFLUSH)
+                except termios.error:
+                    pass
                 # Echo is cleared by setraw; this is belt-and-braces for the
                 # (unusual) case of a platform where it is not.
                 attrs = termios.tcgetattr(fd)

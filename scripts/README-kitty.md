@@ -91,6 +91,12 @@ python3 scripts/lib/kitty_fixtures.py --selftest
 - The pty is put in `-echo` mode in every scenario so Kitty `OK` replies cannot
   leak into the grid. The probe and DSR helpers use `/dev/tty`, restore termios,
   and never read the FIFO.
+- All raw-mode helpers call `tty.setraw(fd, when=termios.TCSANOW)`. Python's
+  default `TCSAFLUSH` silently discards the pty input queue, which would throw
+  away replies queued before a fresh drain process starts (`reply-default`
+  depends on reading exactly those bytes). `kitty_probe.py` flushes input
+  explicitly *before* writing the probe; GNU `stty raw` used by the iTerm2 DSR
+  path does not flush queued input (verified with a queued-byte pty test).
 - Geometry expectations follow `worktrees/kitty-protocol/docs/kitty-graphics-protocol.md`:
   `c`/`r` reserve a cell box and letterbox (no distortion); default cursor moves
   right by `c` and down by `r`; `C=1` leaves it; placement deletion is

@@ -52,7 +52,7 @@ def main(argv):
         proc = subprocess.Popen(cmd, stdin=slave, stdout=slave, stderr=slave,
                                 cwd=a.cwd, preexec_fn=os.setsid, close_fds=True)
         os.close(slave)
-        tty.setraw(0)
+        tty.setraw(0, when=termios.TCSANOW)  # keep any queued terminal replies
         capture = bytearray()
         deadline = time.time() + a.timeout
         while time.time() < deadline and proc.poll() is None:

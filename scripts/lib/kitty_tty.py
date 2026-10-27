@@ -36,7 +36,7 @@ def exchange(fd, payload, timeout):
     old = termios.tcgetattr(fd)
     data = b""
     try:
-        tty.setraw(fd)
+        tty.setraw(fd, when=termios.TCSANOW)  # TCSAFLUSH would discard queued replies
         os.write(fd, payload)
         deadline = time.time() + timeout
         while time.time() < deadline:
