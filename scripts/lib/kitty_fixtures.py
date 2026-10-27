@@ -57,6 +57,23 @@ def make_fixtures(outdir):
     img.save(p, "PNG", optimize=False)
     created[os.path.basename(p)] = os.path.getsize(p)
 
+    # 2b. Small (2-chunk) and >200 kB (many-chunk) PNGs.
+    img = _noise_img(36, 36, 13)
+    for y in range(12):
+        for x in range(12):
+            img.putpixel((x, y), MAGENTA)
+    p = os.path.join(outdir, "noise-3kb.png")
+    img.save(p, "PNG", optimize=False)
+    created[os.path.basename(p)] = os.path.getsize(p)
+
+    img = _noise_img(300, 300, 14)
+    for y in range(75):
+        for x in range(75):
+            img.putpixel((x, y), MAGENTA)
+    p = os.path.join(outdir, "noise-300k.png")
+    img.save(p, "PNG", optimize=False)
+    created[os.path.basename(p)] = os.path.getsize(p)
+
     # 3. Source-rect image: left half red, right half blue.
     img = Image.new("RGB", (200, 100), RED)
     for y in range(100):
@@ -163,6 +180,12 @@ def selftest():
 
         check(created.get("chunked-480x320.png", 0) > 3000, "chunked png file size")
         check(created.get("chunk-100k.png", 0) > 60000, "chunk-100k png file size")
+        b3 = len(base64.b64encode(open(os.path.join(td, "noise-3kb.png"), "rb").read()))
+        b300 = len(base64.b64encode(open(os.path.join(td, "noise-300k.png"), "rb").read()))
+        check(3073 <= b3 <= 6144, "noise-3kb is a 2-chunk payload (%d b64)" % b3)
+        check(b300 > 200000, "noise-300k base64 > 200 kB (%d)" % b300)
+        img = Image.open(os.path.join(td, "noise-3kb.png")).convert("RGB")
+        check(img.getpixel((0, 0)) == MAGENTA, "noise-3kb marker")
 
     print("%d checks, %d failures" % (checks, failures))
     return 0 if failures == 0 else 1

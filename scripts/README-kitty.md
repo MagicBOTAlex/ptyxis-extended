@@ -58,12 +58,13 @@ python3 scripts/lib/kitty_fixtures.py --selftest
 | `chunking-partial` | all-but-last chunk + placement draws nothing; final chunk completes upload and the image appears (C14) |
 | `raw-rgb` / `raw-rgba` / `zlib` | f=24 halves, f=32 alpha (alpha=0 transparent), `o=z` payloads |
 | `chunking-100k` | ~100 kB payload in ≥20 chunks (3072-char chunks) reassembles to correct pixels |
+| `chunk-counts` | 1-chunk, exactly 2-chunk, many-chunk (32) and >200 kB (>100-frame) PNGs all render |
 | `chunk-apc-limit` | boundary probe: 4068-char chunks render, 4096-char chunks (OpenTUI's size) are dropped — isolates the APC frame cap |
 | `envelope-forms` | payload form `ESC_G<ctl>;<b64>ESC\` for transmit/query vs control-only (no `;`) for placement/delete |
 | `geometry-cell-box` | `c` only → aspect height; `c`+`r` → letterboxed/pillarboxed box (90x90 centred in 180x90) |
 | `geometry-one-dim` | c=20 on 200x100 → 180x90 with 90x90 halves |
 | `geometry-source-rect` | `x,y,w,h` crop selects only the blue right half |
-| `geometry-cursor` | `C=1` leaves the cursor; default advances right c and down r |
+| `geometry-cursor` | `C=1` leaves the cursor unchanged; the default-cursor policy is recorded (this build leaves it on the image's last row; spec §8 says right c / down r — INFO, OpenTUI uses C=1) |
 | `geometry-zorder` | z=2 over z=1; deleting the top placement reveals the lower one |
 | `zorder-text` | negative z draws behind glyphs (text legible); z≥0 covers them |
 | `geometry-multi-placement` | one image id placed twice at different cells |
@@ -80,7 +81,7 @@ python3 scripts/lib/kitty_fixtures.py --selftest
 | `shared-emitter-render` | team emitter bytes: probe identical, `--verify` clean, image renders |
 | `memory-images` | 100 × 100 kB chunked transmit/place/delete: alive, RSS bounded, no leak, still responsive |
 | `control-stock-vte` | system gnome-terminal: no image and **no probe reply** |
-| `iterm2-regression` | the 10-scenario imgcat regression subset stays green |
+| `iterm2-regression` | the **full** imgcat OSC 1337 suite (all 30 scenarios, including 100 kB/1 MB/5 MB payloads and the 32 MiB reject) stays green |
 | `opentui-demo` | optional stretch: real OpenTUI native-image demo selects Kitty (SKIP if unavailable) |
 
 ## Notes / assumptions

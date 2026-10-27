@@ -110,7 +110,7 @@ fi
 
 find_emitter() {
     local c
-    for c in "$EMITTER_OPT" "$LIB/emit_imgcat.py" \
+    for c in "$EMITTER_OPT" "$SCRIPT_DIR/emit_imgcat.py" "$LIB/emit_imgcat.py" \
              "$SCRIPT_DIR/../../imgcat-protocol/scripts/emit_imgcat.py" \
              "/home/metal/projects/console-extend/worktrees/imgcat-protocol/scripts/emit_imgcat.py"; do
         [ -n "$c" ] && [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
