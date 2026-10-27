@@ -1,5 +1,5 @@
 {
-  description = "Ptyxis, rebuilt from source with wezterm-like key handling";
+  description = "Ptyxis, rebuilt from source with wezterm-like key handling and inline images";
 
   inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
 

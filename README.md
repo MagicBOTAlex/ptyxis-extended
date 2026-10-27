@@ -347,6 +347,38 @@ security posture.
 
 ---
 
+## Inline Images (`imgcat`)
+
+This build patches VTE to implement the [iTerm2 inline image
+protocol](https://iterm2.com/documentation-images.html) (`OSC 1337 ; File=...`),
+so images render as real raster graphics — the same mechanism WezTerm uses —
+instead of falling back to Unicode/block glyphs. Any client that speaks the
+protocol works:
+
+```bash
+wezterm imgcat photo.png
+chafa --format=iterm photo.png
+# or iTerm2's imgcat shell script
+```
+
+Supported parameters: `inline`, `width` / `height` (`N` cells, `Npx`, `N%`,
+`auto`), `preserveAspectRatio`, `doNotMoveCursor`, and `name` / `size` (parsed,
+not stored). Images are anchored to grid rows, so they scroll with the
+scrollback, are culled when their rows are evicted, and are dropped on clear,
+reset and alternate-screen exit. The OSC payload limit is raised from 4096 code
+points to 16 Mi, with explicit ceilings of 32 MiB encoded, 25 MP / 64 MiB per
+image and 192 MiB per screen.
+
+Known limitations: images are drawn as an overlay, so text printed over them
+does not erase them, and `ED 0/1` / `EL` do not clip them. Animation, multipart
+transfers and non-inline file downloads are not implemented. See
+[`docs/iterm2-inline-images.md`](docs/iterm2-inline-images.md) for the wire
+format, sizing rules and a conformance checklist, and
+[`scripts/imgcat-e2e.sh`](scripts/imgcat-e2e.sh) for the headless end-to-end
+tests.
+
+---
+
 ## How It Works (Agent-UI Interaction & Fallbacks)
 
 Ptyxis UI and `ptyxis-agent` communicate via D-Bus messages over a `socketpair()`.
