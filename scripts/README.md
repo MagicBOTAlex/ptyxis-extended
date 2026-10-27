@@ -71,6 +71,8 @@ bad invocation.
 | `size-px` | `width=200px` -> 200px wide, aspect-derived height (C10/C12) |
 | `size-percent` | `width=50%` of the viewport (C10) |
 | `size-one-dim` | `width=20` only -> height derived from aspect (C12) |
+| `size-stretch` | `preserveAspectRatio=0` with both dimensions -> exact 200x200 stretch (C13) |
+| `size-letterbox` | `preserveAspectRatio=1` with both dimensions -> 200x200 box, 200x133 bitmap centred (C13) |
 | `inline-zero` | `inline=0` draws nothing, cursor unchanged (C17) |
 | `wire-errors` | invalid base64, truncated payload, missing terminator: silent drop, no cursor move (C2/C9) |
 | `two-images` | back-to-back images sit side by side on the first image's bottom row (C23) |
@@ -81,7 +83,10 @@ bad invocation.
 | `tall-image` | explicit tall box scrolls rather than being squeezed to the viewport (C15) |
 | `large-image` | 3000x2000 PNG: no hang/OOM, downscaled to fit, aspect preserved |
 | `photo-payload` | a normal 480x320 noisy PNG (~440 KB, ~590 KB sequence) renders |
-| `scrollback-eviction` | 60 images + 12k lines: alive, memory bounded (C26) |
+| `payload-boundary` | sequences just under (3938 B) and over (4142 B) the old 4096-byte VTE OSC cap both render |
+| `payload-100k` / `payload-1m` / `payload-5m` | ~100 KB, ~1 MB and ~5 MB base64 payloads render, are fast, and keep RSS bounded |
+| `payload-oversize` | a >32 MiB base64 sequence (36 MB) is dropped silently: alive, <1.5 GB RSS, no hang, terminal usable afterwards |
+| `memory-guard` | 120 large images + ~48k lines: RSS returns to baseline after eviction (+~6 MB), second batch plateaus (C26) |
 | `erase-semantics` | **aspirational** text-overwrite / `EL 2` cell erasure (C22/C27); reported as a known gap, never fails the suite |
 | `control-omitted` | no escape sequence -> no image, while text still renders |
 | `control-xterm` | the same bytes in xterm draw nothing |
@@ -131,7 +136,15 @@ python3 scripts/lib/test_pixels.py
 - `control-stock-vte` uses the distro `gnome-terminal`/system VTE. On this
   sandbox it was installed with apt explicitly to provide an unpatched control;
   the scenario skips cleanly when neither `gnome-terminal` nor `kgx` exists.
-- Images whose OSC sequence exceeds VTE's 4096-byte OSC string limit are dropped
-  before the patch ever sees them (see the report); this is why `large-image`
-  and `photo-payload` fail on small, highly-compressible fixtures only if the
-  payload crosses that threshold.
+- Payload ceilings: the patch raises VTE's OSC string capacity to 16 Mi code
+  points and also checks `kMaxImageEncodedBytes` (32 MiB) before decoding.
+  Because the parser limit is 16 Mi characters, the effective ceiling is the
+  parser's (~16 MiB of base64), so the 32 MiB check is currently unreachable;
+  `payload-oversize` verifies the drop is silent and bounded either way.
+- Sizing assertions use `plain-magenta-480x320.png` (no border) so the detected
+  magenta bbox equals the painted bitmap bounds, making cell/px/percent/
+  one-dimension/preserveAspectRatio checks numeric rather than approximate.
+- `memory-guard` distinguishes "images still in scrollback" (legitimately
+  retained, bounded by the scrollback limit) from a leak: after all images are
+  flushed out of history RSS must fall back to near baseline, and a second
+  batch must not add another image-sized chunk.

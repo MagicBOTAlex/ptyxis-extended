@@ -55,6 +55,8 @@ ALL_SCENARIOS=(
     size-px
     size-percent
     size-one-dim
+    size-stretch
+    size-letterbox
     inline-zero
     wire-errors
     two-images
@@ -65,7 +67,12 @@ ALL_SCENARIOS=(
     tall-image
     large-image
     photo-payload
-    scrollback-eviction
+    payload-boundary
+    payload-100k
+    payload-1m
+    payload-5m
+    payload-oversize
+    memory-guard
     erase-semantics
     control-omitted
     control-xterm
@@ -392,38 +399,78 @@ sc_do_not_move_cursor() {
     fi
 }
 
+# Convert a calibration cell dimension to int for bash arithmetic.
+cell_w_i() { python3 -c "print(int(round($(cell_w))))"; }
+cell_h_i() { python3 -c "print(int(round($(cell_h))))"; }
+
+# Expected DSR "row col" after an image whose box is box_w x box_h starting at (1,1).
+box_cursor() { # box_w box_h
+    local bw=$1 bh=$2 cwi chi
+    cwi=$(cell_w_i); chi=$(cell_h_i)
+    local rows cols
+    read -r rows cols <<<"$(scenario_dims)"
+    python3 -c "print((($bh+$chi-1)//$chi), min((($bw+$cwi-1)//$cwi)+1, $cols))"
+}
+
+# Bounding box of the plain solid-magenta fixture -> BB_X BB_Y BB_W BB_H BB_C BB_F
+bbox_plain() {
+    read -r BB_X BB_Y BB_W BB_H BB_C BB_F <<<"$(bbox_of "$1" '#FF00FF')"
+    ck_info bbox "x=$BB_X y=$BB_Y w=$BB_W h=$BB_H count=$BB_C found=$BB_F"
+}
+
+# Assert the drawn footprint matches the spec box/bitmap size.
+expect_bbox_size() { # label ew eh tol
+    local label=$1 ew=$2 eh=$3 tol=${4:-2}
+    if [ "$BB_F" = 1 ] && [ "$BB_C" -ge 1000 ] &&
+       [ $((BB_W - ew)) -le "$tol" ] && [ $((ew - BB_W)) -le "$tol" ] &&
+       [ $((BB_H - eh)) -le "$tol" ] && [ $((eh - BB_H)) -le "$tol" ]; then
+        ck_pass "$label-size" "drawn ${BB_W}x${BB_H}, expected ${ew}x${eh} (tol ${tol}px)"
+    else
+        ck_fail "$label-size" "drawn ${BB_W}x${BB_H}, expected ${ew}x${eh} (tol ${tol}px); magenta=$BB_C found=$BB_F"
+    fi
+}
+
+assert_cursor_at() { # label expected_row expected_col
+    local cur
+    cur=$(session_cursor 2>/dev/null) || { ck_fail "$1" "no DSR reply"; return; }
+    ck_info "$1-dsr" "$cur (expected $2,$3)"
+    if [ "${cur%% *}" = "$2" ] && [ "${cur##* }" = "$3" ]; then
+        ck_pass "$1" "cursor ($cur) matches expected ($2,$3)"
+    else
+        ck_fail "$1" "cursor ($cur), expected ($2,$3)"
+    fi
+}
+
+expect_origin_y() { # label expected_y tol
+    if [ $((BB_Y - $2)) -le "${3:-2}" ] && [ $(($2 - BB_Y)) -le "${3:-2}" ]; then
+        ck_pass "$1" "bbox y=$BB_Y matches expected $2"
+    else
+        ck_fail "$1" "bbox y=$BB_Y, expected $2 (tol ${3:-2})"
+    fi
+}
+
 sc_size_cells() {
-    local cw ch bx by bw bh bc f cy exp_y
-    cw=$(cell_w); ch=$(cell_h)
-    # Box 20x10 cells = 180x180px. Native aspect 1.5 -> drawn 180x120, letterboxed
-    # vertically by 30px (C13/C16).
-    emit_seq "$SC/emitted.bin" --inline 1 --width 20 --height 10 --terminator bel "$FIX/magenta-480x320.png" ||
+    local cwi chi cy bw bh er ec
+    cwi=$(cell_w_i); chi=$(cell_h_i)
+    # Box 20x10 cells = 180x180px; native aspect 1.5 -> draw 180x120,
+    # letterboxed vertically by (180-120)/2 = 30px (C13/C16).
+    bw=$((20 * cwi)); bh=$((10 * chi))
+    emit_seq "$SC/emitted.bin" --inline 1 --width 20 --height 10 --terminator bel "$FIX/plain-magenta-480x320.png" ||
         { ck_fail emission "emit failed"; return; }
     session_send "cat '$SC/emitted.bin'" "$TIMEOUT" || { ck_fail emit "timed out"; return; }
     session_shot "$SC/shots/after.png"
-    read -r bx by bw bh bc f <<<"$(bbox_of "$SC/shots/after.png" '#FF00FF')"
-    ck_info bbox "x=$bx y=$by w=$bw h=$bh count=$bc"
-    if [ "$f" != 1 ] || [ "$bc" -lt 20000 ]; then
-        ck_fail present "image missing or tiny (magenta=$bc)"
+    bbox_plain "$SC/shots/after.png"
+    if [ "$BB_F" != 1 ] || [ "$BB_C" -lt 1000 ]; then
+        ck_fail present "image missing (magenta=$BB_C)"
         return
     fi
-    ck_pass present "image rendered, magenta=$bc"
-    if [ $((bw - 176)) -le 4 ] && [ $((176 - bw)) -le 4 ] &&
-       [ $((bh - 116)) -le 4 ] && [ $((116 - bh)) -le 4 ]; then
-        ck_pass size "letterboxed 176x116 interior (box 20x10 cells), got ${bw}x${bh}"
-    else
-        ck_fail size "expected letterboxed 176x116 (box 20x10 cells), got ${bw}x${bh} (C13/C16)"
-    fi
-    # Centred vertically inside the 180px box: bbox top = content_y + 30 + 2.
+    ck_pass present "image rendered (magenta=$BB_C)"
+    expect_bbox_size "cells" "$bw" "$((bw * 320 / 480))" 2
     read -r _ cy <<<"$(content_origin)"
-    exp_y=$((cy + 30 + 2))
-    ck_info centering "bbox_y=$by expected=$exp_y (box top $cy, letterbox offset 30px)"
-    if [ $((by - exp_y)) -le 6 ] && [ $((exp_y - by)) -le 6 ]; then
-        ck_pass centred "bitmap centred vertically in its box (y=$by ~ $exp_y)"
-    else
-        ck_fail centred "bitmap not centred: y=$by expected ~$exp_y (C13)"
-    fi
-    if [ "$(inside_window "$bx" "$by" "$bw" "$bh")" = yes ]; then
+    expect_origin_y "cells-centred" $((cy + (bh - bw * 320 / 480) / 2)) 2
+    read -r er ec <<<"$(box_cursor "$bw" "$bh")"
+    assert_cursor_at "cells-cursor" "$er" "$ec"
+    if [ "$(inside_window "$BB_X" "$BB_Y" "$BB_W" "$BB_H")" = yes ]; then
         ck_pass in-window "image within window"
     else
         ck_fail in-window "image outside window"
@@ -431,75 +478,113 @@ sc_size_cells() {
 }
 
 sc_size_px() {
-    local bx by bw bh bc f
-    # width=200px -> height = round(200/1.5) = 133; interior 196x129.
-    emit_seq "$SC/emitted.bin" --inline 1 --width 200px --terminator bel "$FIX/magenta-480x320.png" ||
+    local cwi chi cy w h er ec
+    cwi=$(cell_w_i); chi=$(cell_h_i)
+    w=200; h=$(python3 -c "print(int(round(200 / (480.0/320.0))))")  # 133
+    emit_seq "$SC/emitted.bin" --inline 1 --width 200px --terminator bel "$FIX/plain-magenta-480x320.png" ||
         { ck_fail emission "emit failed"; return; }
     session_send "cat '$SC/emitted.bin'" "$TIMEOUT" || { ck_fail emit "timed out"; return; }
     session_shot "$SC/shots/after.png"
-    read -r bx by bw bh bc f <<<"$(bbox_of "$SC/shots/after.png" '#FF00FF')"
-    ck_info bbox "x=$bx y=$by w=$bw h=$bh count=$bc"
-    if [ "$f" != 1 ] || [ "$bc" -lt 10000 ]; then
-        ck_fail present "image missing or tiny (magenta=$bc)"
+    bbox_plain "$SC/shots/after.png"
+    if [ "$BB_F" != 1 ] || [ "$BB_C" -lt 1000 ]; then
+        ck_fail present "image missing (magenta=$BB_C)"
         return
     fi
-    ck_pass present "image rendered, magenta=$bc"
-    if [ $((bw - 196)) -le 3 ] && [ $((196 - bw)) -le 3 ] &&
-       [ $((bh - 129)) -le 3 ] && [ $((129 - bh)) -le 3 ]; then
-        ck_pass size "200px wide, aspect height (196x129 interior), got ${bw}x${bh}"
-    else
-        ck_fail size "expected 196x129 interior for width=200px, got ${bw}x${bh} (C10/C12)"
-    fi
+    ck_pass present "image rendered (magenta=$BB_C)"
+    expect_bbox_size "px" "$w" "$h" 2
+    read -r _ cy <<<"$(content_origin)"
+    expect_origin_y "px-top" "$cy" 2
+    read -r er ec <<<"$(box_cursor "$w" "$h")"
+    assert_cursor_at "px-cursor" "$er" "$ec"
 }
 
 sc_size_percent() {
-    local cw rows cols vw ew eh bx by bw bh bc f
-    cw=$(cell_w)
+    local cwi chi cy vw w h er ec
+    cwi=$(cell_w_i); chi=$(cell_h_i)
+    local rows cols
     read -r rows cols <<<"$(scenario_dims)"
-    vw=$(python3 -c "print($cols * $cw)")
-    ew=$(python3 -c "print(int(round(0.5 * $vw)) - 4)")
-    eh=$(python3 -c "print(int(round(round(0.5 * $vw) / 1.5)) - 4)")
-    emit_seq "$SC/emitted.bin" --inline 1 --width 50% --terminator bel "$FIX/magenta-480x320.png" ||
+    vw=$((cols * cwi))
+    w=$(python3 -c "print(int(round(0.5 * $vw)))")
+    h=$(python3 -c "print(int(round($w / (480.0/320.0))))")
+    emit_seq "$SC/emitted.bin" --inline 1 --width 50% --terminator bel "$FIX/plain-magenta-480x320.png" ||
         { ck_fail emission "emit failed"; return; }
     session_send "cat '$SC/emitted.bin'" "$TIMEOUT" || { ck_fail emit "timed out"; return; }
     session_shot "$SC/shots/after.png"
-    read -r bx by bw bh bc f <<<"$(bbox_of "$SC/shots/after.png" '#FF00FF')"
-    ck_info bbox "x=$bx y=$by w=$bw h=$bh count=$bc (grid ${cols}x${rows}, vw=${vw}px)"
-    if [ "$f" != 1 ] || [ "$bc" -lt 10000 ]; then
-        ck_fail present "image missing or tiny (magenta=$bc)"
+    bbox_plain "$SC/shots/after.png"
+    if [ "$BB_F" != 1 ] || [ "$BB_C" -lt 1000 ]; then
+        ck_fail present "image missing (magenta=$BB_C)"
         return
     fi
-    ck_pass present "image rendered, magenta=$bc"
-    if [ $((bw - ew)) -le 4 ] && [ $((ew - bw)) -le 4 ] &&
-       [ $((bh - eh)) -le 4 ] && [ $((eh - bh)) -le 4 ]; then
-        ck_pass size "width=50% -> ${bw}x${bh} interior (expected ${ew}x${eh})"
-    else
-        ck_fail size "width=50% -> ${bw}x${bh}, expected ${ew}x${eh} (C10)"
-    fi
+    ck_pass present "image rendered (magenta=$BB_C)"
+    expect_bbox_size "percent" "$w" "$h" 2
+    read -r _ cy <<<"$(content_origin)"
+    expect_origin_y "percent-top" "$cy" 2
+    read -r er ec <<<"$(box_cursor "$w" "$h")"
+    assert_cursor_at "percent-cursor" "$er" "$ec"
 }
 
 sc_size_one_dim() {
-    local cw ch ew eh bx by bw bh bc f
-    cw=$(cell_w); ch=$(cell_h)
-    # width=20 cells = 180px; height derived from aspect = 120px; interior 176x116.
-    emit_seq "$SC/emitted.bin" --inline 1 --width 20 --terminator bel "$FIX/magenta-480x320.png" ||
+    local cwi chi cy w h er ec
+    cwi=$(cell_w_i); chi=$(cell_h_i)
+    w=$((20 * cwi)); h=$((w * 320 / 480))
+    emit_seq "$SC/emitted.bin" --inline 1 --width 20 --terminator bel "$FIX/plain-magenta-480x320.png" ||
         { ck_fail emission "emit failed"; return; }
     session_send "cat '$SC/emitted.bin'" "$TIMEOUT" || { ck_fail emit "timed out"; return; }
     session_shot "$SC/shots/after.png"
-    read -r bx by bw bh bc f <<<"$(bbox_of "$SC/shots/after.png" '#FF00FF')"
-    ew=176; eh=116
-    ck_info bbox "x=$bx y=$by w=$bw h=$bh count=$bc"
-    if [ "$f" != 1 ] || [ "$bc" -lt 20000 ]; then
-        ck_fail present "image missing or tiny (magenta=$bc)"
+    bbox_plain "$SC/shots/after.png"
+    if [ "$BB_F" != 1 ] || [ "$BB_C" -lt 1000 ]; then
+        ck_fail present "image missing (magenta=$BB_C)"
         return
     fi
-    ck_pass present "image rendered, magenta=$bc"
-    if [ $((bw - ew)) -le 4 ] && [ $((ew - bw)) -le 4 ] &&
-       [ $((bh - eh)) -le 4 ] && [ $((eh - bh)) -le 4 ]; then
-        ck_pass size "width=20 cells -> ${bw}x${bh}, height from aspect (expected ${ew}x${eh})"
-    else
-        ck_fail size "width=20 cells -> ${bw}x${bh}, expected ${ew}x${eh} (C12)"
+    ck_pass present "image rendered (magenta=$BB_C)"
+    expect_bbox_size "one-dim" "$w" "$h" 2
+    read -r _ cy <<<"$(content_origin)"
+    expect_origin_y "one-dim-top" "$cy" 2
+    read -r er ec <<<"$(box_cursor "$w" "$h")"
+    assert_cursor_at "one-dim-cursor" "$er" "$ec"
+}
+
+sc_size_stretch() {
+    local cy er ec
+    # preserveAspectRatio=0 with both dimensions: stretch to 200x200 (C13).
+    emit_seq "$SC/emitted.bin" --inline 1 --width 200px --height 200px \
+        --preserve-aspect-ratio 0 --terminator bel "$FIX/plain-magenta-480x320.png" ||
+        { ck_fail emission "emit failed"; return; }
+    session_send "cat '$SC/emitted.bin'" "$TIMEOUT" || { ck_fail emit "timed out"; return; }
+    session_shot "$SC/shots/after.png"
+    bbox_plain "$SC/shots/after.png"
+    if [ "$BB_F" != 1 ] || [ "$BB_C" -lt 1000 ]; then
+        ck_fail present "image missing (magenta=$BB_C)"
+        return
     fi
+    ck_pass present "image rendered (magenta=$BB_C)"
+    expect_bbox_size "stretch" 200 200 2
+    read -r _ cy <<<"$(content_origin)"
+    expect_origin_y "stretch-top" "$cy" 2
+    read -r er ec <<<"$(box_cursor 200 200)"
+    assert_cursor_at "stretch-cursor" "$er" "$ec"
+}
+
+sc_size_letterbox() {
+    local cy er ec draw_h off_y
+    draw_h=$(python3 -c "print(int(round(200 / (480.0/320.0))))")  # 133
+    off_y=$(( (200 - draw_h) / 2 ))
+    emit_seq "$SC/emitted.bin" --inline 1 --width 200px --height 200px \
+        --preserve-aspect-ratio 1 --terminator bel "$FIX/plain-magenta-480x320.png" ||
+        { ck_fail emission "emit failed"; return; }
+    session_send "cat '$SC/emitted.bin'" "$TIMEOUT" || { ck_fail emit "timed out"; return; }
+    session_shot "$SC/shots/after.png"
+    bbox_plain "$SC/shots/after.png"
+    if [ "$BB_F" != 1 ] || [ "$BB_C" -lt 1000 ]; then
+        ck_fail present "image missing (magenta=$BB_C)"
+        return
+    fi
+    ck_pass present "image rendered (magenta=$BB_C)"
+    expect_bbox_size "letterbox" 200 "$draw_h" 2
+    read -r _ cy <<<"$(content_origin)"
+    expect_origin_y "letterbox-top" $((cy + off_y)) 2
+    read -r er ec <<<"$(box_cursor 200 200)"
+    assert_cursor_at "letterbox-cursor" "$er" "$ec"
 }
 
 sc_inline_zero() {
@@ -639,7 +724,7 @@ sc_two_images_newline() {
 }
 
 sc_scrollback() {
-    local bx by bw bh bc f cx cy cw2 ch2 cc cf
+    local bx by bw bh bc f cx cy cc cf
     emit_seq "$SC/emitted.bin" --inline 1 --terminator bel "$FIX/magenta-480x320.png" || { ck_fail emission "emit failed"; return; }
     session_send "cat '$SC/emitted.bin'" "$TIMEOUT" || { ck_fail emit "timed out"; return; }
     session_shot "$SC/shots/before-text.png"
@@ -675,7 +760,7 @@ sc_scrollback() {
         return
     fi
     read -r bx by bw bh bc f <<<"$(bbox_of "$shot" '#FF00FF')"
-    read -r cx cy cw2 ch2 cc cf <<<"$(bbox_of "$shot" '#00FFFF')"
+    read -r cx cy _ _ cc cf <<<"$(bbox_of "$shot" '#00FFFF')"
     ck_info scrolled-bbox "x=$bx y=$by w=$bw h=$bh count=$bc"
     if [ $((bw - MAG_IN_W)) -le 2 ] && [ $((MAG_IN_W - bw)) -le 2 ] &&
        [ $((bh - MAG_IN_H)) -le 2 ] && [ $((MAG_IN_H - bh)) -le 2 ]; then
@@ -769,35 +854,38 @@ sc_clear() {
 }
 
 sc_tall_image() {
-    local bx by bw bh bc f cur rows cols
-    # Explicit 20x200-cell box (180x3600px) for a 100x1200 image: the bitmap is
-    # fitted to 180x2160 and the screen must scroll, not squeeze (C15). The PNG
-    # is kept under the 4096-byte OSC cap (3342-byte sequence) so this test
-    # measures sizing, not the payload limit.
-    emit_seq "$SC/emitted.bin" --inline 1 --width 20 --height 200 --terminator bel "$FIX/tall-100x1200.png" ||
+    local bx by bw bh bc f cur rows cols er cwi chi expected_w
+    # Explicit height=200 cells (3600px) only: width is aspect-derived, so the
+    # bitmap fills the reserved box (no letterboxing into scrollback).  A
+    # 100x1200 image => box 300x3600, which must scroll (C15/C19), not be
+    # squeezed to the viewport.  The PNG is 2489B, well under every payload cap.
+    cwi=$(cell_w_i); chi=$(cell_h_i)
+    expected_w=$(python3 -c "print(int(round(200 * $chi * (100.0/1200.0))))")
+    emit_seq "$SC/emitted.bin" --inline 1 --height 200 --terminator bel "$FIX/tall-100x1200.png" ||
         { ck_fail emission "emit failed"; return; }
     session_send "printf 'MARKER-BEFORE-IMAGE\\n'; cat '$SC/emitted.bin'" "$TIMEOUT" ||
         { ck_fail emit "timed out"; return; }
     session_shot "$SC/shots/after.png"
     read -r bx by bw bh bc f <<<"$(bbox_of "$SC/shots/after.png" '#FF8800')"
     read -r rows cols <<<"$(scenario_dims)"
-    ck_info bbox "x=$bx y=$by w=$bw h=$bh count=$bc found=$f (grid ${cols}x${rows})"
-    if [ "$f" = 1 ] && [ "$bw" -ge 170 ] && [ "$bw" -le 190 ]; then
-        ck_pass width "explicit 20-cell width honoured (bbox w=$bw, expected ~180)"
+    ck_info bbox "x=$bx y=$by w=$bw h=$bh count=$bc found=$f (grid ${cols}x${rows}, expected box ${expected_w}x$((200*chi)))"
+    if [ "$f" = 1 ] && [ $((bw - expected_w)) -le 3 ] && [ $((expected_w - bw)) -le 3 ]; then
+        ck_pass width "explicit 200-cell height honoured; aspect-derived width=$bw (expected ~$expected_w)"
     else
-        ck_fail width "explicit 20-cell width ignored/squeezed (bbox w=$bw, expected ~180) (C15)"
+        ck_fail width "explicit height ignored/squeezed: bbox w=$bw, expected ~$expected_w (C15)"
     fi
-    if [ "$f" = 1 ] && [ "${bc:-0}" -ge 5000 ]; then
-        ck_pass rendered "tall bitmap painted (orange=$bc, bbox ${bw}x${bh})"
+    if [ "$f" = 1 ] && [ "${bc:-0}" -ge 20000 ]; then
+        ck_pass rendered "tall bitmap painted and clipped by the viewport (orange=$bc, bbox ${bw}x${bh})"
     else
         ck_fail rendered "tall bitmap not painted (orange=$bc)"
     fi
+    # C19: the image pushes rows into scrollback; its bottom row is on screen.
     cur=$(session_cursor 2>/dev/null) || cur="?"
-    ck_info cursor-after "$cur (grid rows=$rows; scrolling image should end on the last row)"
+    ck_info cursor-after "$cur (grid rows=$rows)"
     if [ "${cur%% *}" = "$rows" ]; then
-        ck_pass scrolled "explicit tall image scrolled the screen, cursor on last row ($cur)"
+        ck_pass scrolled "explicit tall image scrolled, cursor on the last row ($cur) (C19)"
     else
-        ck_info scrolled "cursor at ($cur), grid has $rows rows (scroll not observed)"
+        ck_fail scrolled "cursor at ($cur), expected last row ($rows) after scrolling (C19)"
     fi
     if session_alive; then ck_pass alive "ptyxis alive after tall image"; else ck_fail alive "ptyxis died on tall image"; fi
 }
@@ -879,39 +967,66 @@ sc_photo_payload() {
     fi
 }
 
-sc_scrollback_eviction() {
-    local rss0 rss1 delta t0 t1 dt
+sc_memory_guard() {
+    local rss0 rssA rssB rssC rssD
+    local lines=300 images=60
+    # Batch: `images` x 480x320 (~600 kB decoded) interleaved with `lines`
+    # text lines => images*(18+lines) rows, past the scrollback limit.
+    _mem_batch() {
+        session_send "for i in \$(seq 1 $images); do printf '\\033]1337;File=inline=1:'; base64 -w0 '$FIX/magenta-480x320.png'; printf '\\a'; for j in \$(seq 1 $lines); do echo \"mem \$1 \$i-\$j ----------------------------------------------------------------\"; done; done" 120
+    }
+    # Push every image out of the retained history.
+    _mem_flush() {
+        session_send "for j in \$(seq 1 12000); do echo \"flush $1 \$j ------------------------------------------------------------------\"; done" 120
+    }
     rss0=$(session_rss_kb)
-    t0=$(date +%s)
-    session_send "for i in \$(seq 1 60); do printf '\\033]1337;File=inline=1:'; base64 -w0 '$FIX/magenta-480x320.png'; printf '\\a'; for j in \$(seq 1 200); do echo \"evict \$i-\$j ----------------------------------------------------------------\"; done; done" 90 ||
-        { ck_fail emit "eviction loop timed out"; return; }
-    t1=$(date +%s)
-    dt=$((t1 - t0))
-    sleep 0.5
-    session_shot "$SC/shots/after.png"
-    rss1=$(session_rss_kb)
-    delta=$((rss1 - rss0))
-    ck_info memory "rss ${rss0}kB -> ${rss1}kB (delta ${delta}kB) after 60 images + 12000 lines in ${dt}s"
-    if session_alive; then ck_pass alive "ptyxis alive after 60 images and 12k scrolled lines"; else ck_fail alive "ptyxis died during scrollback stress"; return; fi
-    if [ "$rss1" -lt 1500000 ]; then
-        ck_pass memory-bounded "rss=${rss1}kB (<1.5GB) after scrollback stress"
+    _mem_batch A || { ck_fail batch-a "timed out"; return; }
+    sleep 0.6
+    rssA=$(session_rss_kb)
+    _mem_flush A || { ck_fail flush-a "timed out"; return; }
+    sleep 0.6
+    rssB=$(session_rss_kb)
+    _mem_batch B || { ck_fail batch-b "timed out"; return; }
+    sleep 0.6
+    rssC=$(session_rss_kb)
+    _mem_flush B || { ck_fail flush-b "timed out"; return; }
+    sleep 0.6
+    rssD=$(session_rss_kb)
+
+    ck_info memory "rss idle=${rss0}kB  after-A=${rssA}kB  after-flush-A=${rssB}kB  after-B=${rssC}kB  after-flush-B=${rssD}kB (kB)"
+    ck_info deltas "batchA=+$((rssA-rss0))kB flushA=$((rssB-rssA))kB batchB=+$((rssC-rssB))kB flushB=$((rssD-rssC))kB"
+    ck_info context "each batch = 60 images (~600kB decoded each, 36MB) + ${lines} lines each; scrollback eviction should release them"
+
+    if session_alive; then ck_pass alive "ptyxis alive after 120 images and ~48k lines"; else ck_fail alive "ptyxis died during memory stress"; return; fi
+    if [ "$rssD" -lt 1500000 ]; then
+        ck_pass memory-bounded "rss=${rssD}kB (<1.5GB) after memory stress"
     else
-        ck_fail memory-bounded "rss=${rss1}kB (>=1.5GB); image memory not released on scrollback eviction (C26)"
+        ck_fail memory-bounded "rss=${rssD}kB (>=1.5GB); unbounded image memory (C26)"
     fi
-    if [ "$delta" -gt 30000 ]; then
-        ck_info eviction "rss grew ${delta}kB for 60 scrolled-off 480x320 images (~600kB decoded each): images are retained after scrollback eviction rather than freed (C26)"
+    # With a 10k-row scrollback, after the flush no image should be retained.
+    # The old build leaked +30MB for 60 images and kept growing.
+    local hold=$((rssB - rss0))
+    if [ "$hold" -lt 20000 ]; then
+        ck_pass freed-after-eviction "after all images left history RSS is only +${hold}kB above idle (C26)"
     else
-        ck_info eviction "rss growth ${delta}kB: no evidence of retained image memory"
+        ck_fail freed-after-eviction "RSS still +${hold}kB above idle after every image was evicted (C26)"
     fi
-    if [ "$delta" -lt 200000 ]; then
-        ck_pass no-runaway "growth ${delta}kB over 60 image/text cycles"
+    local grow=$((rssC - rssB))
+    if [ "$grow" -lt 45000 ]; then
+        ck_pass batch-b-bounded "second 60-image batch grew RSS ${grow}kB (<45MB; scrollback-limited, not leaking)"
     else
-        ck_fail no-runaway "rss grew ${delta}kB over 60 images (possible image leak, C26)"
+        ck_fail batch-b-bounded "second 60-image batch grew RSS ${grow}kB (>=45MB); images accumulate in history (C26)"
     fi
-    # Scroll to the very top and back; must not crash.
+    local hold2=$((rssD - rss0))
+    if [ "$hold2" -lt 25000 ]; then
+        ck_pass plateau "after two full cycles RSS is +${hold2}kB above idle; history does not accumulate image memory"
+    else
+        ck_fail plateau "after two full cycles RSS is +${hold2}kB above idle; image memory accumulates (C26)"
+    fi
+
     local wx wy ww wh
     read -r wx wy ww wh <<<"$(session_window_geom)"
-    xdotool mousemove $((wx + ww / 2)) $((wy + wh / 2)) click --repeat 400 --delay 2 4 2>/dev/null
+    xdotool mousemove $((wx + ww / 2)) $((wy + wh / 2)) click --repeat 600 --delay 2 4 2>/dev/null
     sleep 0.8
     session_shot "$SC/shots/top.png"
     if session_alive; then ck_pass alive-after-scrollback "ptyxis alive after scrolling back through evicted history"; else ck_fail alive-after-scrollback "ptyxis crashed scrolling evicted history"; fi
@@ -1042,6 +1157,131 @@ sc_control_stock_vte() {
     sleep 0.3
 }
 
+# ---------------------------------------------------- payload size regressions
+
+sc_payload_boundary() {
+    local name f seq cnt under=0 over=0
+    for pair in "under:$FIX/seq-under-4096.png" "over:$FIX/seq-over-4096.png"; do
+        name=${pair%%:*}; f=${pair#*:}
+        emit_seq "$SC/emitted-$name.bin" --inline 1 --terminator bel "$f" ||
+            { ck_fail "emission-$name" "emit failed"; continue; }
+        seq=$(stat -c %s "$SC/emitted-$name.bin")
+        ck_info "size-$name" "$seq bytes (old VTE OSC cap: 4096)"
+        session_send "printf '\\033[H\\033[2J\\033[3J'" 10 >/dev/null 2>&1 || true
+        session_send "cat '$SC/emitted-$name.bin'" 30 || { ck_fail "emit-$name" "timed out"; continue; }
+        sleep 0.4
+        session_shot "$SC/shots/$name.png"
+        cnt=$(count_of "$SC/shots/$name.png" '#FF8800')
+        ck_info "pixels-$name" "orange=$cnt"
+        if [ "${cnt:-0}" -ge 5000 ]; then
+            ck_pass "render-$name" "sequence ${seq}B rendered (orange=$cnt)"
+        else
+            ck_fail "render-$name" "sequence ${seq}B dropped (orange=$cnt)"
+        fi
+        if [ "$seq" -lt 4096 ]; then under=$seq; fi
+        if [ "$seq" -gt 4096 ]; then over=$seq; fi
+    done
+    if [ "$under" -gt 0 ] && [ "$over" -gt 0 ]; then
+        ck_pass boundary "pair brackets the old 4096-byte cap: ${under}B renders, ${over}B renders"
+    else
+        ck_fail boundary "fixtures do not bracket 4096 (under=$under over=$over)"
+    fi
+    if session_alive; then ck_pass alive "ptyxis alive after boundary payloads"; else ck_fail alive "ptyxis died"; fi
+}
+
+# Generic large-payload rendering test.
+payload_big() { # label fixture min_bytes max_bytes timeout_s
+    local label=$1 f=$2 minb=$3 maxb=$4 tmo=$5
+    local seq cnt rss t0 t1 dt
+    emit_seq "$SC/emitted-$label.bin" --inline 1 --terminator bel "$f" ||
+        { ck_fail "$label-emission" "emit failed"; return; }
+    seq=$(stat -c %s "$SC/emitted-$label.bin")
+    ck_info "$label-size" "${seq} bytes base64 (PNG $(stat -c %s "$f") bytes)"
+    if [ "$seq" -ge "$minb" ] && [ "$seq" -le "$maxb" ]; then
+        ck_pass "$label-fixture" "sequence ${seq}B within target ${minb}..${maxb}B"
+    else
+        ck_fail "$label-fixture" "sequence ${seq}B outside target ${minb}..${maxb}B"
+    fi
+    t0=$(date +%s%N)
+    session_send "cat '$SC/emitted-$label.bin'" "$tmo" || { ck_fail "$label-emit" "timed out after ${tmo}s"; return; }
+    t1=$(date +%s%N)
+    dt=$(python3 -c "print(round(($t1-$t0)/1e9,2))")
+    sleep 0.6
+    session_shot "$SC/shots/$label.png"
+    cnt=$(count_of "$SC/shots/$label.png" '#FF00FF')
+    rss=$(session_rss_kb)
+    ck_info "$label-run" "emit+render ${dt}s, magenta=$cnt, rss=${rss}kB"
+    if session_alive; then ck_pass "$label-alive" "ptyxis alive after ${seq}B payload"; else ck_fail "$label-alive" "ptyxis died"; return; fi
+    if [ "${cnt:-0}" -ge 500 ]; then
+        ck_pass "$label-render" "rendered (magenta marker=$cnt)"
+    else
+        ck_fail "$label-render" "not rendered (magenta=$cnt)"
+    fi
+    if python3 -c "import sys; sys.exit(0 if $dt < 60 else 1)"; then
+        ck_pass "$label-time" "completed in ${dt}s (<60s)"
+    else
+        ck_fail "$label-time" "took ${dt}s (>=60s)"
+    fi
+    if [ "$rss" -gt 0 ] && [ "$rss" -lt 1500000 ]; then
+        ck_pass "$label-memory" "rss=${rss}kB (<1.5GB)"
+    else
+        ck_fail "$label-memory" "rss=${rss}kB"
+    fi
+}
+
+sc_payload_100k() { payload_big 100k "$FIX/noise-100k.png" 80000 120000 30; }
+sc_payload_1m()   { payload_big 1m   "$FIX/noise-1m.png"   800000 1100000 30; }
+sc_payload_5m()   { payload_big 5m   "$FIX/noise-5m.png"   4000000 5500000 60; }
+
+sc_payload_oversize() {
+    local seq rss0 rss1 dt t0 t1 mag green
+    emit_seq "$SC/emitted-oversize.bin" --inline 1 --terminator bel "$FIX/noise-oversize.png" ||
+        { ck_fail emission "emit failed"; return; }
+    seq=$(stat -c %s "$SC/emitted-oversize.bin")
+    ck_info size "${seq} bytes base64; patch cap kMaxImageEncodedBytes=32MiB (33554432), VTE parser cap 16Mi chars"
+    if [ "$seq" -gt 33554432 ]; then
+        ck_pass oversize-fixture "sequence ${seq}B exceeds the 32MiB encoded cap"
+    else
+        ck_fail oversize-fixture "sequence ${seq}B does not exceed 32MiB"
+    fi
+    rss0=$(session_rss_kb)
+    t0=$(date +%s%N)
+    session_send "cat '$SC/emitted-oversize.bin'" 120 || { ck_fail emit "oversize emission timed out (>120s) — possible hang"; return; }
+    t1=$(date +%s%N)
+    dt=$(python3 -c "print(round(($t1-$t0)/1e9,2))")
+    sleep 0.6
+    rss1=$(session_rss_kb)
+    session_shot "$SC/shots/after.png"
+    mag=$(count_of "$SC/shots/after.png" '#FF00FF')
+    ck_info run "completed in ${dt}s, rss ${rss0}kB -> ${rss1}kB, magenta=$mag"
+    if session_alive; then ck_pass alive "ptyxis alive after ${seq}B oversize sequence"; else ck_fail alive "ptyxis died/OOMed on oversize sequence"; return; fi
+    if python3 -c "import sys; sys.exit(0 if $dt < 90 else 1)"; then
+        ck_pass time "completed in ${dt}s (<90s)"
+    else
+        ck_fail time "took ${dt}s (>=90s)"
+    fi
+    if [ "$rss1" -lt 1500000 ]; then
+        ck_pass memory "rss=${rss1}kB (<1.5GB, delta $((rss1-rss0))kB)"
+    else
+        ck_fail memory "rss=${rss1}kB (>=1.5GB)"
+    fi
+    if [ "${mag:-1}" -eq 0 ]; then
+        ck_pass dropped "nothing drawn from oversize payload"
+    else
+        ck_fail dropped "oversize payload unexpectedly drew magenta=$mag"
+    fi
+    # The terminal must still be usable afterwards.
+    session_send "printf '\\033[38;2;0;255;0mOVERSIZE-RECOVERED\\033[0m\\n'" 20 || true
+    session_shot "$SC/shots/recovered.png"
+    green=$(count_of "$SC/shots/recovered.png" '#00FF00' 80)
+    ck_info recovered-text "green=$green"
+    if [ "${green:-0}" -ge 100 ]; then
+        ck_pass recovered "terminal usable after oversize drop (green text=$green)"
+    else
+        ck_fail recovered "terminal not usable after oversize sequence (green=$green)"
+    fi
+}
+
 # ------------------------------------------------------------------ runner
 
 finalize_scenario() {
@@ -1113,6 +1353,8 @@ run_scenario() {
             size-px) sc_size_px ;;
             size-percent) sc_size_percent ;;
             size-one-dim) sc_size_one_dim ;;
+            size-stretch) sc_size_stretch ;;
+            size-letterbox) sc_size_letterbox ;;
             inline-zero) sc_inline_zero ;;
             wire-errors) sc_wire_errors ;;
             two-images) sc_two_images ;;
@@ -1123,7 +1365,12 @@ run_scenario() {
             tall-image) sc_tall_image ;;
             large-image) sc_large_image ;;
             photo-payload) sc_photo_payload ;;
-            scrollback-eviction) sc_scrollback_eviction ;;
+            payload-boundary) sc_payload_boundary ;;
+            payload-100k) sc_payload_100k ;;
+            payload-1m) sc_payload_1m ;;
+            payload-5m) sc_payload_5m ;;
+            payload-oversize) sc_payload_oversize ;;
+            memory-guard) sc_memory_guard ;;
             erase-semantics) sc_erase_semantics ;;
             control-omitted) sc_control_omitted ;;
             control-xterm) sc_control_xterm ;;
@@ -1153,7 +1400,29 @@ convert -size 480x320 gradient:'#301040-#103080' -seed 7 +noise Random \
     >>"$RUN/harness.log" 2>&1
 convert -size 100x1200 xc:'#FF8800' -strip -depth 8 "PNG24:$FIX/tall-100x1200.png" \
     >>"$RUN/harness.log" 2>&1
-log "fixtures: magenta=$(stat -c %s "$FIX/magenta-480x320.png")B photo=$(stat -c %s "$FIX/photo-480x320.png")B large=$(stat -c %s "$FIX/large-3000x2000.png")B tall=$(stat -c %s "$FIX/tall-100x1200.png")B"
+# Solid magenta without a border: magenta bbox == painted bitmap bounds, so
+# sizing and cursor assertions can be numeric.
+convert -size 480x320 xc:'#FF00FF' -strip -depth 8 "PNG24:$FIX/plain-magenta-480x320.png" \
+    >>"$RUN/harness.log" 2>&1
+# Just under / just over the old 4096-byte VTE OSC cap.
+convert -size 190x1200 xc:'#FF8800' -strip -depth 8 "PNG24:$FIX/seq-under-4096.png" \
+    >>"$RUN/harness.log" 2>&1
+convert -size 200x1200 xc:'#FF8800' -strip -depth 8 "PNG24:$FIX/seq-over-4096.png" \
+    >>"$RUN/harness.log" 2>&1
+# Incompressible payloads with a 25%-area magenta marker for render detection.
+convert -size 160x160 xc:'#202020' -seed 3 +noise Random -fill '#FF00FF' \
+    -draw 'rectangle 0,0 39,39' -strip -depth 8 "PNG24:$FIX/noise-100k.png" \
+    >>"$RUN/harness.log" 2>&1
+convert -size 500x500 xc:'#202020' -seed 3 +noise Random -fill '#FF00FF' \
+    -draw 'rectangle 0,0 124,124' -strip -depth 8 "PNG24:$FIX/noise-1m.png" \
+    >>"$RUN/harness.log" 2>&1
+convert -size 1120x1120 xc:'#202020' -seed 3 +noise Random -fill '#FF00FF' \
+    -draw 'rectangle 0,0 279,279' -strip -depth 8 "PNG24:$FIX/noise-5m.png" \
+    >>"$RUN/harness.log" 2>&1
+convert -size 3000x3000 xc:'#202020' -seed 5 +noise Random -strip -depth 8 \
+    "PNG24:$FIX/noise-oversize.png" >>"$RUN/harness.log" 2>&1
+log "fixtures: magenta=$(stat -c %s "$FIX/magenta-480x320.png")B plain=$(stat -c %s "$FIX/plain-magenta-480x320.png")B photo=$(stat -c %s "$FIX/photo-480x320.png")B large=$(stat -c %s "$FIX/large-3000x2000.png")B tall=$(stat -c %s "$FIX/tall-100x1200.png")B"
+log "payloads: under4096=$(stat -c %s "$FIX/seq-under-4096.png")B over4096=$(stat -c %s "$FIX/seq-over-4096.png")B 100k=$(stat -c %s "$FIX/noise-100k.png")B 1m=$(stat -c %s "$FIX/noise-1m.png")B 5m=$(stat -c %s "$FIX/noise-5m.png")B oversize=$(stat -c %s "$FIX/noise-oversize.png")B"
 
 display_start "$RUN/display" || { log "could not start Xvfb"; exit 2; }
 log "display: $DISPLAY ($(xdpyinfo 2>/dev/null | awk '/dimensions:/ {print $2}'))"
