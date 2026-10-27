@@ -57,7 +57,8 @@ python3 scripts/lib/kitty_fixtures.py --selftest
 | `basic-render` | chunked PNG (`m=1`, >3072 B) transmit + `a=p`; 360x240 render, cyan inset; continuation chunks carry only `m`/`q` |
 | `chunking-partial` | all-but-last chunk + placement draws nothing; final chunk completes upload and the image appears (C14) |
 | `raw-rgb` / `raw-rgba` / `zlib` | f=24 halves, f=32 alpha (alpha=0 transparent), `o=z` payloads |
-| `chunking-100k` | ~100 kB payload in ≥20 chunks reassembles to correct pixels |
+| `chunking-100k` | ~100 kB payload in ≥20 chunks (3072-char chunks) reassembles to correct pixels |
+| `chunk-apc-limit` | boundary probe: 4068-char chunks render, 4096-char chunks (OpenTUI's size) are dropped — isolates the APC frame cap |
 | `envelope-forms` | payload form `ESC_G<ctl>;<b64>ESC\` for transmit/query vs control-only (no `;`) for placement/delete |
 | `geometry-cell-box` | `c` only → aspect height; `c`+`r` → letterboxed/pillarboxed box (90x90 centred in 180x90) |
 | `geometry-one-dim` | c=20 on 200x100 → 180x90 with 90x90 halves |
@@ -69,11 +70,12 @@ python3 scripts/lib/kitty_fixtures.py --selftest
 | `delete-image-id` | `d=i` removes placements but keeps data (re-place works); `d=I` frees data (re-place no-op) |
 | `delete-placement` | `d=i,i=..,p=..` removes only that placement |
 | `delete-all` | `d=a` removes all placements; data-retention recorded |
-| `retransmit` | retransmitting an id replaces data and drops old placements; new placement shows new pixels |
+| `retransmit` | retransmitting an id replaces the image data; records whether the implementation drops or updates existing placements (spec says drop) |
 | `lifecycle-scroll` | image scrolls away with text and returns from scrollback |
 | `lifecycle-resize` | shrink/grow alive, placement remains |
 | `lifecycle-clear` | ED2+ED3 clears images |
 | `lifecycle-altscreen` | alt screen images independent; primary restored on exit |
+| `reply-default` | with q absent, transmit/placement produce OK replies (spec C5); guards the q=2 silence test from being vacuous |
 | `quiet-q2` | after a successful probe, q=2 transmit/place/delete produce no replies |
 | `shared-emitter-render` | team emitter bytes: probe identical, `--verify` clean, image renders |
 | `memory-images` | 100 × 100 kB chunked transmit/place/delete: alive, RSS bounded, no leak, still responsive |
@@ -99,6 +101,11 @@ python3 scripts/lib/kitty_fixtures.py --selftest
   fails (no probe reply, zero image pixels), while `envelope-forms`
   (`wire-only`), `control-stock-vte`, `iterm2-regression` and (optionally)
   `opentui-demo` SKIP/FAIL as expected.
+- APC frame ceiling: this agent found that the terminal caps the whole APC frame
+  at 4096 characters, so a 4096-character base64 chunk plus its control data is
+  dropped. OpenTUI splits at 3072 raw bytes = exactly 4096 base64 chars, so
+  `chunk-apc-limit` and the default `shared-emitter-render` path fail. Scenarios
+  that are not testing this cap use 3072-char chunks.
 - `scripts/opentui-kitty-findings.md` documents the stretch-goal investigation:
   OpenTUI's client path was proven with a simulated Kitty reply; the checkout's
   native library could not be built here (no Zig 0.16).

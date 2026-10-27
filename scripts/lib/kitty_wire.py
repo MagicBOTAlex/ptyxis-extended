@@ -95,6 +95,7 @@ def main(argv):
 
     p = sub.add_parser("raw")
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--chunk", type=int, default=4096)
     p.add_argument("--width", type=int, required=True)
     p.add_argument("--height", type=int, required=True)
     p.add_argument("--format", type=int, choices=(24, 32), required=True)
@@ -160,6 +161,7 @@ def main(argv):
         raw = open(a.file, "rb").read()
         data = k.raw_frames(a.width, a.height, raw, a.format, action=a.action,
                             image_id=a.image_id, zlib_compress=a.zlib,
+                            chunk_size=a.chunk,
                             extra={"q": "2"} if a.quiet else None)
         write_out(data, a.out)
         return 0
