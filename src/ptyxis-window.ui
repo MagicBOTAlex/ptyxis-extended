@@ -634,11 +634,10 @@
                         </child>
                         <child type="title">
                           <object class="AdwWindowTitle">
-                            <binding name="subtitle">
-                              <lookup name="subtitle" type="PtyxisTab">
-                                <lookup name="active-tab">PtyxisWindow</lookup>
-                              </lookup>
-                            </binding>
+                            <!-- No subtitle: a single-line title keeps the
+                                 header bar as slim as WezTerm's tab strip.
+                                 The working directory is still available from
+                                 the tab title/tooltip. -->
                             <binding name="title">
                               <lookup name="title" type="PtyxisTab">
                                   <lookup name="active-tab">PtyxisWindow</lookup>

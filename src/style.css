@@ -175,3 +175,48 @@ window.has-tab-bar .visual-bell-area {
   padding-top: 3px;
   padding-bottom: 3px;
 }
+
+/* Compact title bar.  The stock Adwaita header bar is ~46px tall, which eats
+ * a lot of vertical space in a terminal; collapse its padding and controls so
+ * more rows fit on screen. */
+window.ptyxis-window headerbar.main-header-bar,
+window.ptyxis-window headerbar.main-header-bar windowhandle,
+window.ptyxis-window headerbar.main-header-bar windowhandle > box,
+window.ptyxis-window headerbar.main-header-bar windowhandle > box > widget,
+window.ptyxis-window headerbar.main-header-bar box.start,
+window.ptyxis-window headerbar.main-header-bar box.end,
+window.ptyxis-window headerbar.main-header-bar windowcontrols {
+  min-height: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  margin-top: 0;
+  margin-bottom: 0;
+}
+window.ptyxis-window headerbar.main-header-bar button,
+window.ptyxis-window headerbar.main-header-bar menubutton > button,
+window.ptyxis-window headerbar.main-header-bar togglebutton,
+window.ptyxis-window headerbar.main-header-bar button.titlebutton {
+  min-height: 20px;
+  min-width: 20px;
+  padding: 1px 4px;
+  margin-top: 0;
+  margin-bottom: 0;
+}
+window.ptyxis-window headerbar.main-header-bar image {
+  -gtk-icon-size: 14px;
+}
+
+/* Match the compact title bar: the stock tab strip is ~46px tall too. */
+window.ptyxis-window tabbar tabbox {
+  min-height: 24px;
+  padding-top: 2px;
+  padding-bottom: 2px;
+}
+window.ptyxis-window tabbar tab {
+  min-height: 24px;
+  padding: 2px 4px;
+}
+window.ptyxis-window tabbar tab button.image-button {
+  min-width: 20px;
+  min-height: 20px;
+}
