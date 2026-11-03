@@ -326,6 +326,8 @@ security posture.
   - "Window Dressing" applies palette colors to the window theme.
 - **Keyboard Shortcuts:**
   - Most actions have configurable shortcuts via Preferences.
+  - When closing a tab or window with running processes, press `y` to confirm
+    or `n` / `Escape` to cancel — no mouse needed.
 - **Transparency:**
   - Optional background transparency, adjustable via GSettings.
     Example (set 15% transparency, schema ID may vary):

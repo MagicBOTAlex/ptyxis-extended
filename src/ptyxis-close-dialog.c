@@ -21,6 +21,7 @@
 #include "config.h"
 
 #include <glib/gi18n.h>
+#include <gdk/gdkkeysyms.h>
 
 #include "ptyxis-tab.h"
 #include "ptyxis-close-dialog.h"
@@ -61,6 +62,76 @@ ptyxis_close_dialog_confirm (AdwAlertDialog *dialog,
     }
 }
 
+static GtkWidget *
+ptyxis_close_dialog_find_discard_button (GtkWidget *widget)
+{
+  g_assert (GTK_IS_WIDGET (widget));
+
+  for (GtkWidget *child = gtk_widget_get_first_child (widget);
+       child != NULL;
+       child = gtk_widget_get_next_sibling (child))
+    {
+      GtkWidget *found;
+
+      if (GTK_IS_BUTTON (child) &&
+          gtk_widget_has_css_class (child, "destructive-action"))
+        return child;
+
+      if ((found = ptyxis_close_dialog_find_discard_button (child)))
+        return found;
+    }
+
+  return NULL;
+}
+
+static gboolean
+ptyxis_close_dialog_key_pressed (GtkEventControllerKey *controller,
+                                 guint                  keyval,
+                                 guint                  keycode,
+                                 GdkModifierType        state,
+                                 AdwAlertDialog        *dialog)
+{
+  g_assert (GTK_IS_EVENT_CONTROLLER_KEY (controller));
+  g_assert (ADW_IS_ALERT_DIALOG (dialog));
+
+  /* Leave modified key combinations (and anything typed into a future
+   * entry) to the default handler.
+   */
+  if (state & (GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_SUPER_MASK))
+    return FALSE;
+
+  switch (keyval)
+    {
+    case GDK_KEY_y:
+    case GDK_KEY_Y:
+      {
+        /* Activate the response button itself rather than emitting the
+         * response: AdwAlertDialog closes the dialog before emitting
+         * "response", and doing that manually would bypass its bookkeeping
+         * and could emit a second (close-response) signal.
+         */
+        GtkWidget *button = ptyxis_close_dialog_find_discard_button (GTK_WIDGET (dialog));
+
+        if (button != NULL)
+          {
+            gtk_widget_activate (button);
+            return TRUE;
+          }
+
+        return FALSE;
+      }
+
+    case GDK_KEY_n:
+    case GDK_KEY_N:
+      /* Closing the dialog emits the close-response, which is "cancel". */
+      adw_dialog_close (ADW_DIALOG (dialog));
+      return TRUE;
+
+    default:
+      return FALSE;
+    }
+}
+
 static void
 ptyxis_close_dialog_response (AdwAlertDialog *dialog,
                               const char       *response,
@@ -93,7 +164,10 @@ _ptyxis_close_dialog_new (GtkWindow *parent,
   const char *discard_label;
   PangoAttrList *smaller;
   AdwDialog *dialog;
+  GtkEventController *controller;
   GtkWidget *group;
+  GtkWidget *box;
+  GtkWidget *hint;
 
   g_return_val_if_fail (!parent || GTK_IS_WINDOW (parent), NULL);
   g_return_val_if_fail (tabs != NULL, NULL);
@@ -119,8 +193,34 @@ _ptyxis_close_dialog_new (GtkWindow *parent,
   adw_alert_dialog_set_response_appearance (ADW_ALERT_DIALOG (dialog),
                                               "discard", ADW_RESPONSE_DESTRUCTIVE);
 
+  /* Closing the dialog (Escape, or the "n" shortcut below) cancels; only
+   * the explicit destructive response closes the window/tab.
+   */
+  adw_alert_dialog_set_default_response (ADW_ALERT_DIALOG (dialog), "cancel");
+  adw_alert_dialog_set_close_response (ADW_ALERT_DIALOG (dialog), "cancel");
+
+  /* Allow confirming without reaching for the mouse, like WezTerm. The
+   * controller is in the capture phase so the shortcut wins over focus
+   * navigation inside the dialog.
+   */
+  controller = gtk_event_controller_key_new ();
+  gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (controller),
+                                               GTK_PHASE_CAPTURE);
+  g_signal_connect (controller,
+                    "key-pressed",
+                    G_CALLBACK (ptyxis_close_dialog_key_pressed),
+                    dialog);
+  gtk_widget_add_controller (GTK_WIDGET (dialog), controller);
+
   group = adw_preferences_group_new ();
-  adw_alert_dialog_set_extra_child (ADW_ALERT_DIALOG (dialog), group);
+
+  box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 12);
+  hint = gtk_label_new (_("Press y to close, n to cancel"));
+  gtk_widget_add_css_class (hint, "dim-label");
+  gtk_widget_set_halign (hint, GTK_ALIGN_CENTER);
+  gtk_box_append (GTK_BOX (box), group);
+  gtk_box_append (GTK_BOX (box), hint);
+  adw_alert_dialog_set_extra_child (ADW_ALERT_DIALOG (dialog), box);
 
   smaller = pango_attr_list_new ();
   pango_attr_list_insert (smaller, pango_attr_scale_new (0.8333));
